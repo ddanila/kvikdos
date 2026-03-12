@@ -312,7 +312,8 @@ static char *get_linux_filename_r(const char *p, const DirState *dir_state, char
           dot_count = LINUX_PATH_SIZE + 2;
         } else {
           ++component_count;
-          if (*p == '.') goto error;  /* First character in component is '.'. */
+          /* Allow filenames like .CL1, .CTL etc. (DOS extension-only names). */
+          /* if (*p == '.') goto error; */
         }
         for (; *p != '\0';) {
           const char c = *p;
@@ -625,6 +626,31 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     } else if (0 == strncmp(arg, "--drive=", 8)) {
       arg += 8;
       goto do_drive;
+    } else if (0 == strncmp(arg, "--cwd=", 6)) {
+      /* --cwd=<drive>:\<subdir>\ sets the initial current directory for <drive>. */
+      const char *p = arg + 6;
+      char drive_idx;
+      if ((p[0] & ~32) - 'A' + 0U < DRIVE_COUNT && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) {
+        drive_idx = (p[0] & ~32) - 'A';
+        p += 3;  /* Skip "X:\" */
+        {
+          char *out = cmd_args.dir_state.current_dir[(int)drive_idx];
+          char *out_end = out + 63;
+          while (*p && out < out_end) {
+            char c2 = *p++;
+            if (c2 == '/') c2 = '\\';
+            else if (c2 >= 'a' && c2 <= 'z') c2 &= ~32;
+            *out++ = c2;
+          }
+          /* Ensure trailing backslash. */
+          if (out > cmd_args.dir_state.current_dir[(int)drive_idx] &&
+              out[-1] != '\\' && out < out_end) *out++ = '\\';
+          *out = '\0';
+        }
+      } else {
+        fprintf(stderr, "fatal: --cwd must be <drive>:\\<path>\\: %s\n", arg + 6);
+        exit(1);
+      }
     } else if (0 == strcmp(arg, "--tty-in")) {
       int char_count;
       if (!argv[0]) goto missing_argument;
@@ -2019,6 +2045,24 @@ static char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. *
  * Returns the DOS exit code reported by the program.
  * As a side effect, sets dir_state->dos_prog_abs = NULL, and may change dir_state and tty_state.
  */
+/* Saved state for nested spawn (ah=0x4b al=0 where parent resumes after child exits). */
+#define SPAWN_DEPTH_MAX 8
+struct SpawnFrame {
+  struct kvm_regs regs;
+  struct kvm_sregs sregs;
+  int mapped_handles[20 - 5];
+  char had_get_ints, had_get_first_mcb;
+  unsigned tick_count;
+  unsigned char sphinx_cmm_flags;
+  char ctrl_break_checking;
+  unsigned dta_seg_ofs;
+  unsigned short last_dos_error_code;
+  char port_0x40_tick;
+  unsigned malloc_strategy;
+  char cleanup_fn[16];
+  char *mem_snapshot;  /* malloc'd, DOS_MEM_LIMIT bytes */
+};
+
 static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
   int img_fd;
   struct kvm_fds kvm_fds;
@@ -2045,11 +2089,19 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   enum malloc_strategy_t { MS_FIRST_FIT = 0, MS_BEST_FIT = 1, MS_LAST_FIT = 2 };
   unsigned malloc_strategy;
   char cleanup_fn[16];
+  struct SpawnFrame spawn_stack[SPAWN_DEPTH_MAX];
+  int spawn_depth;
+  unsigned char last_spawn_exit_code;  /* Exit code from last spawned child (ah=0x4d). */
+  unsigned char last_spawn_exit_type;  /* Exit type: 0=normal, 1=Ctrl+C, 2=critical error, 3=TSR. */
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
   { struct SA { int StaticAssert_ShortSize : sizeof(short) == 2; }; }  /* Assumed by *(unsigned short*)... in many places. */
   { struct SA { int StaticAssert_IntSize : sizeof(int) == 4; }; }  /* Assumed by *(unsigned*)... in many places. */
+
+  spawn_depth = 0;
+  last_spawn_exit_code = 0;
+  last_spawn_exit_type = 0;
 
   if (!prog_filename) {
     img_fd = -1;
@@ -2273,10 +2325,42 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           goto do_exit;
         } else if (int_num == 0x21) {  /* DOS file and memory sevices. */
           /* !! Should we set CF=0 by default? What does MS-DOS do? */
-          if (ah == 0x4c) {  /* Exit to DOS. */
+          if (ah == 0x4d) {  /* Get child-process exit code (after ah=0x4b spawn). */
+            *(unsigned char*)&regs.rax = last_spawn_exit_code;
+            *(((unsigned char*)&regs.rax) + 1) = last_spawn_exit_type;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x4c) {  /* Exit to DOS. */
             if (cleanup_fn[0] != '\0') unlink(get_linux_filename(cleanup_fn));
-           do_exit:
-            return (unsigned char)regs.rax;
+           do_exit: {
+            unsigned char exit_al = (unsigned char)regs.rax;
+            if (spawn_depth > 0) {
+              struct SpawnFrame *sf = &spawn_stack[--spawn_depth];
+              memcpy(mem, sf->mem_snapshot, DOS_MEM_LIMIT);
+              free(sf->mem_snapshot); sf->mem_snapshot = NULL;
+              regs = sf->regs;
+              sregs = sf->sregs;
+              memcpy(mapped_handles, sf->mapped_handles, sizeof(mapped_handles));
+              had_get_ints = sf->had_get_ints;
+              had_get_first_mcb = sf->had_get_first_mcb;
+              tick_count = sf->tick_count;
+              sphinx_cmm_flags = sf->sphinx_cmm_flags;
+              ctrl_break_checking = sf->ctrl_break_checking;
+              dta_seg_ofs = sf->dta_seg_ofs;
+              last_dos_error_code = sf->last_dos_error_code;
+              port_0x40_tick = sf->port_0x40_tick;
+              malloc_strategy = sf->malloc_strategy;
+              memcpy(cleanup_fn, sf->cleanup_fn, sizeof(cleanup_fn));
+              /* Save child exit code for parent to retrieve via ah=0x4d. */
+              last_spawn_exit_code = exit_al;
+              last_spawn_exit_type = 0;  /* Normal exit. */
+              /* Return AX=0, CF=0 to parent (exec succeeded). */
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0: success. */
+              if (DEBUG) fprintf(stderr, "debug: spawn returned exit_code=%d, resuming parent\n", exit_al);
+              goto set_sregs_regs_and_continue;
+            }
+            return exit_al;
+           }
           } else if (ah == 0x06) {  /* Direct console I/O. */
            func_0x06:
             if ((unsigned char)regs.rdx != 0xff) {  /* Output. */
@@ -2521,6 +2605,38 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             *(unsigned short*)&regs.rax = fd2;
+          } else if (ah == 0x46) {  /* Force duplicate file handle (dup2). BX=src handle, CX=dst handle. */
+            const unsigned short bx = *(unsigned short*)&regs.rbx;
+            const unsigned short cx = *(unsigned short*)&regs.rcx;
+            const int fd_src = get_linux_fd(bx, &kvm_fds);
+            int new_fd;
+            if (fd_src < 0) goto error_invalid_handle;
+            if (cx < 5) {
+              /* Standard handles 0..4: dup2 directly onto the Linux fd. */
+              const int fd_dst = cx == 3 ? 2 : cx == 4 ? 1 : (int)cx;
+              if (dup2(fd_src, fd_dst) < 0) {
+                *(unsigned short*)&regs.rax = get_dos_error_code(errno, 4);
+                goto error_on_21;
+              }
+            } else if (cx < 5 + (unsigned)(sizeof(mapped_handles) / sizeof(mapped_handles[0]))) {
+              /* Handle in mapped range: replace the stored Linux fd. */
+              new_fd = dup(fd_src);
+              if (new_fd < 0) {
+                *(unsigned short*)&regs.rax = get_dos_error_code(errno, 4);
+                goto error_on_21;
+              }
+              if (mapped_handles[cx - 5]) close(mapped_handles[cx - 5]);
+              mapped_handles[cx - 5] = new_fd;
+            } else {
+              /* Handle out of tracked range: just dup (best effort). */
+              new_fd = dup(fd_src);
+              if (new_fd < 0) {
+                *(unsigned short*)&regs.rax = get_dos_error_code(errno, 4);
+                goto error_on_21;
+              }
+              close(new_fd);  /* Can't store it, discard. */
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x39) {  /* Create subdirectory (mkdir). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int result = mkdir(get_linux_filename(p), 0755);
@@ -3158,7 +3274,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               char * const args = al == 0 ?  (char*)mem + (((unsigned short*)params)[2] << 4) + ((unsigned short*)params)[1] + 1  /* (args - 1) is Pascal string with terminating '\r'. */
                                 : psp ? psp + 0x81 : NULL;
               const unsigned char args_size = args ? (unsigned char)args[-1] : 0;
-              const char is_args_normal = args && (args_size < 0x7f && args[args_size] == '\0'); /* '\0' for al == 0 when Borland C++ 2.0 compiler bcc.exe is running tlink.exe */
+              const char is_args_normal = args && (args_size < 0x7f && (args[args_size] == '\0' || args[args_size] == '\r')); /* '\0' for al == 0 when Borland C++ 2.0 compiler bcc.exe; '\r' for normal DOS exec */
               const char is_args_ok = is_args_normal || (args && args_size == '\n' && args[0] == '\n' && args[1] == '.');  /* Power C 2.2.0 compiler pc.exe. Copy all 128 bytes to new PSP. */
               const char is_dos_filename_high = sregs.ds.selector + (*(unsigned short*)&regs.rdx >> 4) >= PSP_PARA;  /* So that dos_filename won't overlap new_env below. */
               char *new_env;
@@ -3187,9 +3303,16 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                * file). However, kvikdos is not smart enough for that, so it
                * just does an exec() and forgets about the parent process.
                */
-              if ((reason = should_skip_exec_program(dos_filename, is_args_normal ? args : NULL, env, &env_end, had_get_first_mcb)) > 0) {
-                fprintf(stderr, "fatal: unsupported program to load: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, is_args_normal ? args : NULL);
-                goto fatal_int;
+              if (al == 3) {
+                reason = should_skip_exec_program(dos_filename, is_args_normal ? args : NULL, env, &env_end, had_get_first_mcb);
+                if (reason > 0) {
+                  fprintf(stderr, "fatal: unsupported program to load: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, is_args_normal ? args : NULL);
+                  goto fatal_int;
+                }
+              } else {
+                reason = should_skip_exec_program(dos_filename, is_args_normal ? args : NULL, env, &env_end, had_get_first_mcb);
+                /* al==0: always allow spawn; save parent state for resume after child exits. */
+                (void)reason;
               }
               if (reason == -1 && is_args_normal && cleanup_fn[0] == '\0' && args[0] == '@' && strlen(args) <= sizeof(cleanup_fn)) {
                 strcpy(cleanup_fn, args + 1);  /* Example args: "@turboc.$ln". */
@@ -3221,6 +3344,39 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (dos_prog_abs[0] == '\0') {
                 fprintf(stderr, "fatal: error getting DOS absolute filename for exec on drive %c: %s\n", new_prog_drive, prog_filename);
                 exit(252);
+              }
+              /* For al==0 (spawn): save parent state so it can be resumed after child exits. */
+              if (al == 0) {
+                if (spawn_depth >= SPAWN_DEPTH_MAX) {
+                  fprintf(stderr, "fatal: spawn stack overflow (depth=%d)\n", spawn_depth);
+                  goto fatal_int;
+                }
+                { struct SpawnFrame *sf = &spawn_stack[spawn_depth];
+                  sf->mem_snapshot = (char*)malloc(DOS_MEM_LIMIT);
+                  if (!sf->mem_snapshot) { fprintf(stderr, "fatal: out of memory for spawn snapshot\n"); goto fatal_int; }
+                  memcpy(sf->mem_snapshot, mem, DOS_MEM_LIMIT);
+                  sf->regs = regs;
+                  sf->sregs = sregs;
+                  /* Adjust saved state to the post-interrupt return address (where CL.EXE resumes). */
+                  { const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));
+                    sf->regs.rip = csip_ptr[0];  /* int_ip: return address in parent */
+                    sf->sregs.cs.selector = csip_ptr[1];  /* int_cs */
+                    sf->sregs.cs.base = (unsigned)csip_ptr[1] << 4;
+                    if (csip_ptr[2] & (1 << 9)) *(unsigned short*)&sf->regs.rflags |= (1 << 9);  /* Restore IF. */
+                    *(unsigned short*)&sf->regs.rsp += 6;  /* Pop ip, cs, flags from stack. */ }
+                  memcpy(sf->mapped_handles, mapped_handles, sizeof(mapped_handles));
+                  sf->had_get_ints = had_get_ints;
+                  sf->had_get_first_mcb = had_get_first_mcb;
+                  sf->tick_count = tick_count;
+                  sf->sphinx_cmm_flags = sphinx_cmm_flags;
+                  sf->ctrl_break_checking = ctrl_break_checking;
+                  sf->dta_seg_ofs = dta_seg_ofs;
+                  sf->last_dos_error_code = last_dos_error_code;
+                  sf->port_0x40_tick = port_0x40_tick;
+                  sf->malloc_strategy = malloc_strategy;
+                  memcpy(sf->cleanup_fn, cleanup_fn, sizeof(cleanup_fn));
+                  ++spawn_depth;
+                  if (DEBUG) fprintf(stderr, "debug: spawn push depth=%d program=(%s) args=(%s)\n", spawn_depth, prog_filename, args_str); }
               }
               goto do_exec;
             } else {
