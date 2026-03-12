@@ -156,7 +156,7 @@ static char detect_prog_filename_type(const char *prog_filename) {
 /* A relatively small struct, no string buffers. */
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
-  char current_dir[DRIVE_COUNT][1];  /* Currently mostly unused. */ /*char current_dir[DRIVE_COUNT][128];*/  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
+  char current_dir[DRIVE_COUNT][64];  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
   const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix (or empty), or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
   char case_mode[DRIVE_COUNT];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
   const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
@@ -2539,6 +2539,45 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const int result = rmdir(get_linux_filename(p));
             if (result < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x3b) {  /* Change current directory (chdir). */
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const char *linux_path = get_linux_filename_r(p, dir_state, fnbuf, NULL);
+            struct stat chdir_st;
+            char chdir_drive_idx = dir_state->drive - 'A';
+            const char *dos_rel;
+            if (p[0] != '\0' && p[1] == ':') chdir_drive_idx = (p[0] & ~32) - 'A';
+            if (linux_path[0] == '\0' || stat(linux_path, &chdir_st) < 0 || !S_ISDIR(chdir_st.st_mode)) {
+              *(unsigned short*)&regs.rax = 3;  /* Path not found. */
+              goto error_on_21;
+            }
+            /* Compute DOS path relative to mount point by stripping linux_mount_dir prefix. */
+            {
+              const char *mount = dir_state->linux_mount_dir[(int)chdir_drive_idx];
+              const size_t mount_len = mount ? strlen(mount) : 0;
+              char *out = dir_state->current_dir[(int)chdir_drive_idx];
+              if (mount && strncmp(linux_path, mount, mount_len) == 0) {
+                dos_rel = linux_path + mount_len;
+              } else {
+                dos_rel = "";
+              }
+              /* Convert linux path separators to DOS, uppercase. */
+              {
+                const char *s = dos_rel;
+                char *d = out;
+                char *out_end = out + 63;
+                while (*s && d < out_end) {
+                  char c2 = *s++;
+                  if (c2 == '/') c2 = '\\';
+                  else if (c2 >= 'a' && c2 <= 'z') c2 &= ~32;
+                  *d++ = c2;
+                }
+                /* Ensure trailing backslash if non-empty. */
+                if (d > out && d[-1] != '\\' && d < out_end) *d++ = '\\';
+                *d = '\0';
+              }
+            }
+            if (DEBUG) fprintf(stderr, "debug: chdir drive %c: -> (%s)\n", 'A' + chdir_drive_idx, dir_state->current_dir[(int)chdir_drive_idx]);
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x41) {  /* Delete file. */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int fd = unlink(get_linux_filename(p));
@@ -3050,18 +3089,53 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             (*(unsigned short*)&regs.rbx) = 0x80;
             SET_SREG(es, 0xfff0);
           } else if (ah == 0x29) {  /* Parse filename for FCB. */
-            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);  /* !! Security: check bounds. */
-            if (*p == '\0' || *p == '\r' || *p == '\n') {
-              char *q = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
-              /* al == 1, *p == '\r' in Microsoft Macro Assembler 6.00B driver masm.exe. */
-              /* al == 0, *p == '\n' in Power C 2.2.0 compiler pc.exe. */
-              *(unsigned char*)&regs.rax = 0;  /* No wildchar characters present. */
-              *q++ = '\0';  /* Drive: 0 is default. */
-              memset(q, ' ', 12);  /* Filename (8) and extension (3). */
-              /* Don't update SI. */
+            const unsigned char al29 = (unsigned char)regs.rax;
+            const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);
+            char *q = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);
+            char has_wildcard = 0;
+            unsigned i;
+            /* Skip leading separators if AL bit 0 is set. */
+            if (al29 & 1) {
+              while (*p == ' ' || *p == ',' || *p == ';' || *p == '\t' || *p == '=' || *p == '+') ++p;
+            }
+            /* Parse drive letter. */
+            if (p[0] != '\0' && (p[0] & ~32) >= 'A' && (p[0] & ~32) <= 'Z' && p[1] == ':') {
+              const char drv = (p[0] & ~32) - 'A';
+              if ((unsigned char)drv >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drv]) {
+                *(unsigned char*)&regs.rax = 0xff;  /* Invalid drive. */
+              } else {
+                *q++ = drv + 1;  /* 1=A:, 2=B:, etc. */
+                p += 2;
+                goto parse_fcb_name;
+              }
             } else {
-              fprintf(stderr, "fatal: unsupported parsing of filename: %s\n", p);  /* For ml.exe, this filename is completely broken, it starts with \r, also in DOSBox. */
-              goto fatal_int;
+              *q++ = 0;  /* Default drive. */
+             parse_fcb_name:
+              /* Parse filename (up to 8 chars). */
+              for (i = 0; i < 8; ++i) {
+                char c2 = *p;
+                if (c2 == '\0' || c2 == '.' || c2 == ' ' || c2 == ',' || c2 == ';' || c2 == '\t' || c2 == '=' || c2 == '+' || c2 == '\r' || c2 == '\n') break;
+                if (c2 == '*') { memset(q + i, '?', 8 - i); has_wildcard = 1; ++p; i = 8; break; }
+                if (c2 == '?') has_wildcard = 1;
+                q[i] = (c2 >= 'a' && c2 <= 'z') ? c2 & ~32 : c2;
+                ++p;
+              }
+              memset(q + i, ' ', 8 - i);
+              q += 8;
+              /* Parse extension (up to 3 chars). */
+              if (*p == '.') ++p;
+              for (i = 0; i < 3; ++i) {
+                char c2 = *p;
+                if (c2 == '\0' || c2 == ' ' || c2 == ',' || c2 == ';' || c2 == '\t' || c2 == '=' || c2 == '+' || c2 == '\r' || c2 == '\n') break;
+                if (c2 == '*') { memset(q + i, '?', 3 - i); has_wildcard = 1; ++p; i = 3; break; }
+                if (c2 == '?') has_wildcard = 1;
+                q[i] = (c2 >= 'a' && c2 <= 'z') ? c2 & ~32 : c2;
+                ++p;
+              }
+              memset(q + i, ' ', 3 - i);
+              /* Update SI to point past parsed string. */
+              *(unsigned short*)&regs.rsi = (unsigned short)(p - (char*)mem - ((unsigned)sregs.ds.selector << 4));
+              *(unsigned char*)&regs.rax = has_wildcard ? 1 : 0;
             }
           } else if (ah == 0x58) {  /* Get/set memory allocation strategy. */
             const unsigned char al = (unsigned char)regs.rax;
@@ -3651,8 +3725,32 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         }
       } else if (0 == memcmp(p_line, "cd", cmd_size)) {
         if (*r != '\0') {
-          fprintf(stderr, "fatal: changing current directory not supported: %s\n", r);
-          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
+          /* Perform chdir via int 21h ah=0x3b logic inline. */
+          const char *linux_path = get_linux_filename_r(arg, dir_state, fnbuf, NULL);
+          struct stat chdir_st2;
+          char chdir_drive_idx2 = dir_state->drive - 'A';
+          if (arg[0] != '\0' && arg[1] == ':') chdir_drive_idx2 = (arg[0] & ~32) - 'A';
+          if (linux_path[0] == '\0' || stat(linux_path, &chdir_st2) < 0 || !S_ISDIR(chdir_st2.st_mode)) {
+            fprintf(stderr, "Invalid directory - %s\r\n", arg);
+            exit_code = 1;
+          } else {
+            const char *mount2 = dir_state->linux_mount_dir[(int)chdir_drive_idx2];
+            const size_t mount_len2 = mount2 ? strlen(mount2) : 0;
+            const char *dos_rel2 = (mount2 && strncmp(linux_path, mount2, mount_len2) == 0) ? linux_path + mount_len2 : "";
+            char *out2 = dir_state->current_dir[(int)chdir_drive_idx2];
+            char *out2_end = out2 + 63;
+            const char *s2 = dos_rel2;
+            char *d2 = out2;
+            while (*s2 && d2 < out2_end) {
+              char c3 = *s2++;
+              if (c3 == '/') c3 = '\\';
+              else if (c3 >= 'a' && c3 <= 'z') c3 &= ~32;
+              *d2++ = c3;
+            }
+            if (d2 > out2 && d2[-1] != '\\' && d2 < out2_end) *d2++ = '\\';
+            *d2 = '\0';
+            exit_code = 0;
+          }
         } else {
           const char *current_dir = dir_state->current_dir[dir_state->drive - 'A'];
           fprintf(stdout, "%c:%s\r\n", dir_state->drive, *current_dir == '\0' ? "\\" : current_dir);
@@ -3715,7 +3813,6 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
                  memcmp(p_line, "chdir", cmd_size) == 0 ||
                  memcmp(p_line, "attrib", cmd_size) == 0 ||
                  memcmp(p_line, "call", cmd_size) == 0 ||
-                 memcmp(p_line, "cd", cmd_size) == 0 ||
                  memcmp(p_line, "choice", cmd_size) == 0 ||
                  memcmp(p_line, "copy", cmd_size) == 0 ||
                  memcmp(p_line, "del", cmd_size) == 0 ||
