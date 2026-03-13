@@ -2324,6 +2324,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
           }
           (void)!write(1, stdout_write_p, stdout_write_end - stdout_write_p);
+        } else if (int_num == 0x03) {  /* Software breakpoint (INT 3). Treat as no-op (no debugger attached). */
+          /* In real DOS with no debugger, INT 3 just irets. */
         } else if (int_num == 0x20) {
           *(unsigned char*)&regs.rax = 0;  /* EXIT_SUCCESS. */
           goto do_exit;
@@ -2506,9 +2508,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *p = '\0';  /* Silently truncate to 64 bytes. */
             if (DEBUG) fprintf(stderr, "debug: get current directory on drive %c: (%s)\n", dir_state->drive, p0);
             *(unsigned short*)&regs.rax = 0x100;  /* DOSBox 0.74-4 also does this. */
-          } else if (ah == 0x3d || ah == 0x3c) {  /* Open to handle (open()). Create to handle (creat()). */
+          } else if (ah == 0x3d || ah == 0x3c || ah == 0x5b) {  /* Open to handle. Create to handle. Create new (fail if exists). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int flags = (ah == 0x3c) ? O_RDWR | O_CREAT | O_TRUNC :
+                (ah == 0x5b) ? O_RDWR | O_CREAT | O_EXCL :
                 *(unsigned char*)&regs.rax & 3;  /* O_RDONLY == 0, O_WRONLY == 1, O_RDWR == 2 same in DOS and Linux. */
             const unsigned char flags3 = (flags & 3);
             /* For create, CX contains attributes (read-only, hidden, system, archive), we just ignore it.
@@ -3572,6 +3575,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (*(unsigned short*)&regs.rax == 0xfb42) {
           } else if (*(unsigned short*)&regs.rax == 0xfb43) {
 #endif
+          } else if (ah == 0x12 && al == 0x2e) {  /* MultDOS MSG_RETRIEVAL (DOS 4.0 internal, MULT.INC sub 46). */
+            /* COMMAND.COM calls this during init to get/set parse and critical error message handler
+             * addresses (DL selects sub-subfunction).  GET: return ES:DI=0:0 (no existing handler).
+             * SET: silently ignore — kvikdos has no message retrieval system. */
+            *(unsigned short*)&regs.rdi = 0;
+            SET_SREG(es, 0);
           } else { fatal_uic:
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal_int;
