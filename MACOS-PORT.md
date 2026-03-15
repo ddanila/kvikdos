@@ -184,6 +184,37 @@ Compare output binaries to KVM-produced ones (should be byte-identical).
 
 **Test**: `make && make run` works on macOS.
 
+## 8086tiny as CPU core
+
+We use [8086tiny](https://github.com/adriancable/8086tiny) (MIT license, forked to
+ddanila/8086tiny) as the foundation for the software CPU backend. It provides a complete,
+proven 8086 instruction set implementation in ~760 lines of C.
+
+### What we use from 8086tiny
+- Instruction decode loop and opcode translation tables
+- ModR/M decoder, all addressing modes
+- All arithmetic/logic with correct flag computation
+- String operations with REP prefixes
+- MUL/DIV, shifts/rotates, BCD instructions
+
+### What we strip/adapt
+- **BIOS lookup tables**: 8086tiny loads decode tables from a BIOS binary at runtime.
+  We extract these tables and embed them as C `const` arrays, eliminating the file dependency.
+- **Register model**: 8086tiny stores registers at `mem[0xF0000]`. We copy registers
+  between kvikdos's `kvm_regs`/`kvm_sregs` and 8086tiny's memory-mapped format at the
+  `cpu8086_run()` boundary.
+- **Peripherals**: Strip keyboard, timer, CGA/Hercules, SDL, disk I/O — kvikdos handles
+  all of this via its existing INT/MMIO handlers.
+- **Main loop exit**: Instead of running until `CS:IP == 0:0`, exit on HLT (for INT
+  dispatch), I/O port access, or MMIO to report back to kvikdos.
+
+### Alternatives considered
+- **i8086emu** (TheFox): MIT, but written in PHP — not usable in a C project.
+- **fake86**: GPLv2 — incompatible with kvikdos's GPL >=2.0 in spirit but adds
+  copyleft complexity; also ~2500 lines and tightly coupled to its own PC emulation.
+- **Writing from scratch**: ~2000 lines of work with subtle flag/decode bugs to shake out.
+  8086tiny is battle-tested (runs Windows 3.0, AutoCAD) and saves significant effort.
+
 ## Risk areas
 
 - **ModR/M decoder correctness** (step 6): all 256 addressing mode combinations.
