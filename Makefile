@@ -10,7 +10,7 @@ XCFLAGS =  # To be overridden from the command-line.
 
 SRCDEPS = kvikdos.c mini_kvm.h
 # On non-Linux (macOS), also compile the software 8086 CPU backend.
-CPU8086_DEPS = cpu8086.c cpu8086.h mini_kvm.h
+CPU8086_DEPS = cpu8086.c cpu8086.h cpu8086_xt.h mini_kvm.h
 
 all: $(ALL)
 
@@ -27,8 +27,13 @@ ifeq ($(shell uname -s),Linux)
 kvikdos: $(SRCDEPS)
 	gcc $(CFLAGS) -o $@ $<
 else
+# cpu8086.c is adapted from XTulator (C99 code), so it needs relaxed flags.
+CPU8086_CFLAGS = -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -fno-strict-aliasing $(XCFLAGS)
 kvikdos: $(SRCDEPS) $(CPU8086_DEPS)
-	$(CC) $(CFLAGS) -o $@ kvikdos.c cpu8086.c
+	$(CC) $(CFLAGS) -c -o kvikdos.o kvikdos.c
+	$(CC) $(CPU8086_CFLAGS) -c -o cpu8086.o cpu8086.c
+	$(CC) -s -o $@ kvikdos.o cpu8086.o
+	@rm -f kvikdos.o cpu8086.o
 endif
 
 kvikdos32: $(SRCDEPS)
