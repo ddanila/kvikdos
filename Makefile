@@ -1,4 +1,4 @@
-.PHONY: all clean run
+.PHONY: all clean run test
 .SUFFIXES:
 MAKEFLAGS += -r
 
@@ -9,6 +9,8 @@ CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Werror=implicit-function-decla
 XCFLAGS =  # To be overridden from the command-line.
 
 SRCDEPS = kvikdos.c mini_kvm.h
+# On non-Linux (macOS), also compile the software 8086 CPU backend.
+CPU8086_DEPS = cpu8086.c cpu8086.h cpu8086_xt.h mini_kvm.h XTulator/XTulator/cpu/cpu.c
 
 all: $(ALL)
 
@@ -18,11 +20,28 @@ clean:
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
 
+test: kvikdos guest.com cat.com printenv.com malloct.com
+	@echo "=== guest.com ===" && ./kvikdos guest.com hello world | grep -q "Hello, World" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== cat.com ===" && echo "test123" | ./kvikdos cat.com | grep -q "test123" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== printenv.com ===" && ./kvikdos printenv.com | grep -q "PATH=" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== malloct.com ===" && ./kvikdos malloct.com | grep -q "malloct OK" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "All tests passed."
+
 %.com: %.nasm
 	nasm -O0 -f bin -o $@ $<
 
+ifeq ($(shell uname -s),Linux)
 kvikdos: $(SRCDEPS)
 	gcc $(CFLAGS) -o $@ $<
+else
+# cpu8086.c is adapted from XTulator (C99 code), so it needs relaxed flags.
+CPU8086_CFLAGS = -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -fno-strict-aliasing $(XCFLAGS)
+kvikdos: $(SRCDEPS) $(CPU8086_DEPS)
+	$(CC) $(CFLAGS) -c -o kvikdos.o kvikdos.c
+	$(CC) $(CPU8086_CFLAGS) -c -o cpu8086.o cpu8086.c
+	$(CC) -s -o $@ kvikdos.o cpu8086.o
+	@rm -f kvikdos.o cpu8086.o
+endif
 
 kvikdos32: $(SRCDEPS)
 	gcc -m32 -fno-pic -march=i686 -mtune=generic $(CFLAGS) -o $@ $<

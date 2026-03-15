@@ -1,0 +1,3 @@
+[submodule "XTulator"]
+	path = XTulator
+	url = https://github.com/ddanila/XTulator.git
