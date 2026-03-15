@@ -91,11 +91,11 @@ With the XTulator CPU backend, the following build successfully on macOS:
 - **EXE2BIN**: PASS
 - **DBOF**: PASS
 - **NOSRVBLD** (message compiler): PASS
-- **CL** (C compiler): FAILS with `unsupported int 0x21 ah:87`
+- **CL** (C compiler): was failing with `unsupported int 0x21 ah:87` — now fixed
 
-The CL failure is NOT a CPU emulation bug — it's a missing DOS API stub in
-kvikdos (INT 21h AH=87h, likely extended memory related). Same limitation
-exists on Linux. All pure-assembly modules (MAPPER, BOOT) build identically.
+INT 21h AH=87h is GETPID from the MS-DOS 4.0 multitasking API. MS C 5.10's
+runtime library calls `getpid()` during compilation, which invokes this. Fixed
+by returning PID=1 (must be nonzero for INT 21h/AH=80h to work).
 
 ## macOS portability notes
 
