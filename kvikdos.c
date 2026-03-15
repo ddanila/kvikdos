@@ -1939,6 +1939,8 @@ static void reset_emu(struct EmuState *emu) {
 #endif /* __linux__ */
   } else {
     mem = emu->mem;
+#ifdef __linux__
+    /* On Linux, MADV_DONTNEED discards pages so they come back zeroed. */
     if (madvise((char*)mem + (((PSP_PARA << 4) + 0xfff) & ~0xfff), DOS_MEM_LIMIT - (((PSP_PARA << 4) + 0xfff) & ~0xfff), MADV_DONTNEED) != 0) {
       perror("fatal: madvise MADV_DONTNEED");
       exit(252);
@@ -1948,6 +1950,10 @@ static void reset_emu(struct EmuState *emu) {
       fprintf(stderr, "madvise failed to zero PSP\n");
       exit(252);
     }
+#else
+    /* On macOS, MADV_DONTNEED is just a hint and does not zero pages. */
+    memset((char*)mem + (PSP_PARA << 4), '\0', DOS_MEM_LIMIT - (PSP_PARA << 4));
+#endif
     memset(mem, '\0', ENV_PARA << 4);
     memset((char*)mem + ENV_LIMIT, '\0', (PSP_PARA << 4) - ENV_LIMIT);
   }
@@ -3503,6 +3509,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             } else {
               goto fatal_int;
             }
+          } else if (ah == 0x87) {  /* GETPID (MS-DOS 4.0 multitasking API). MS C 5.10 getpid() calls this. */
+            *(unsigned short*)&regs.rax = 1;  /* PID = 1. Must be nonzero for INT 21h/AH=80h to work. */
+            *(unsigned short*)&regs.rbx = 0;  /* Parent PID = 0 (no parent). */
           } else {
             goto fatal_int;
            nonfatal_unknown_int_21_call:
