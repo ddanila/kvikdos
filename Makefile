@@ -9,6 +9,8 @@ CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Werror=implicit-function-decla
 XCFLAGS =  # To be overridden from the command-line.
 
 SRCDEPS = kvikdos.c mini_kvm.h
+# On non-Linux (macOS), also compile the software 8086 CPU backend.
+CPU8086_DEPS = cpu8086.c cpu8086.h mini_kvm.h
 
 all: $(ALL)
 
@@ -21,8 +23,13 @@ run: kvikdos guest.com
 %.com: %.nasm
 	nasm -O0 -f bin -o $@ $<
 
+ifeq ($(shell uname -s),Linux)
 kvikdos: $(SRCDEPS)
 	gcc $(CFLAGS) -o $@ $<
+else
+kvikdos: $(SRCDEPS) $(CPU8086_DEPS)
+	$(CC) $(CFLAGS) -o $@ kvikdos.c cpu8086.c
+endif
 
 kvikdos32: $(SRCDEPS)
 	gcc -m32 -fno-pic -march=i686 -mtune=generic $(CFLAGS) -o $@ $<

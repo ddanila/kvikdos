@@ -40,6 +40,9 @@
 #include <unistd.h>
 
 #include "mini_kvm.h"
+#ifndef __linux__
+#include "cpu8086.h"
+#endif
 
 #ifndef DEBUG
 #define DEBUG 0
@@ -2303,9 +2306,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       exit(252);
     }
 #else /* !__linux__ */
-    /* TODO: call cpu8086_run() here (step 5) */
-    fprintf(stderr, "fatal: software CPU not yet implemented\n");
-    exit(252);
+    if (cpu8086_run(&regs, &sregs, run, mem, DOS_MEM_LIMIT) < 0) {
+      fprintf(stderr, "fatal: cpu8086_run internal error\n");
+      exit(252);
+    }
 #endif /* __linux__ */
     if (DEBUG) dump_regs("debug", &regs, &sregs);
 

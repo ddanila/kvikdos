@@ -7,6 +7,9 @@
  * software CPU backend to use the same data types as the KVM backend.
  */
 
+#ifndef MINI_KVM_H
+#define MINI_KVM_H
+
 #include <stdint.h>  /* E.g. uint64_t. */
 
 typedef uint8_t __u8;
@@ -268,3 +271,5 @@ struct kvm_userspace_memory_region {
 #define KVM_MEM_READONLY        (1UL << 1)
 
 #endif /* __linux__ */
+
+#endif /* MINI_KVM_H */
