@@ -12,10 +12,17 @@
 
 #include <stdint.h>  /* E.g. uint64_t. */
 
+/* On Linux, __u8/__u16/__u32/__u64 may already be defined by kernel headers
+ * (via <linux/types.h>) with different underlying types (e.g. unsigned long long
+ * vs unsigned long for __u64).  Only define them on non-Linux. */
+#ifndef __linux__
 typedef uint8_t __u8;
 typedef uint16_t __u16;
 typedef uint32_t __u32;
 typedef uint64_t __u64;
+#else
+#include <linux/types.h>
+#endif
 
 /* Architectural interrupt line count. */
 #define KVM_NR_INTERRUPTS 256
