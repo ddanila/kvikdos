@@ -1,4 +1,4 @@
-.PHONY: all clean run
+.PHONY: all clean run test
 .SUFFIXES:
 MAKEFLAGS += -r
 
@@ -10,7 +10,7 @@ XCFLAGS =  # To be overridden from the command-line.
 
 SRCDEPS = kvikdos.c mini_kvm.h
 # On non-Linux (macOS), also compile the software 8086 CPU backend.
-CPU8086_DEPS = cpu8086.c cpu8086.h cpu8086_xt.h mini_kvm.h
+CPU8086_DEPS = cpu8086.c cpu8086.h cpu8086_xt.h mini_kvm.h XTulator/XTulator/cpu/cpu.c
 
 all: $(ALL)
 
@@ -19,6 +19,13 @@ clean:
 
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
+
+test: kvikdos guest.com cat.com printenv.com malloct.com
+	@echo "=== guest.com ===" && ./kvikdos guest.com hello world | grep -q "Hello, World" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== cat.com ===" && echo "test123" | ./kvikdos cat.com | grep -q "test123" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== printenv.com ===" && ./kvikdos printenv.com | grep -q "PATH=" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== malloct.com ===" && ./kvikdos malloct.com | grep -q "malloct OK" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "All tests passed."
 
 %.com: %.nasm
 	nasm -O0 -f bin -o $@ $<
