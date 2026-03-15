@@ -3112,7 +3112,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               const unsigned char old = ctrl_break_checking;
               ctrl_break_checking = (dl > 0);
               *(unsigned char*)&regs.rdx = old;
-            } else if (al == 5) {
+            } else if (al == 3 || al == 5) {
               *(unsigned char*)&regs.rdx = 'C' - 'A' + 1;  /* Boot drive. */
             } else if (al == 6) {
               *(unsigned short*)&regs.rbx = 0x500;  /* DOS 5.0. */
@@ -3506,6 +3506,19 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 1) {
               *(unsigned short*)&regs.rbx = *(unsigned short*)&regs.rdx = 437;  /* CP-437: https://en.wikipedia.org/wiki/Code_page_437 */
+            } else {
+              goto fatal_int;
+            }
+          } else if (ah == 0x69) {  /* Get/set disk serial number (DOS 4.0+). */
+            const unsigned char al = (unsigned char)regs.rax;
+            if (al == 0) {  /* Get serial number. */
+              /* DS:DX -> buffer: word info_level (0), dword serial_number, 11-byte volume_label, 8-byte fs_type. */
+              char *buf = (char*)mem + (sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+              memset(buf, 0, 25);
+              buf[2] = 0x01; buf[3] = 0x23; buf[4] = 0x45; buf[5] = 0x67;  /* Dummy serial 0x67452301. */
+              memcpy(buf + 6, "NO NAME    ", 11);  /* Volume label. */
+              memcpy(buf + 17, "FAT12   ", 8);     /* FS type. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0 (success). */
             } else {
               goto fatal_int;
             }
