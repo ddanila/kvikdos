@@ -81,6 +81,22 @@ INT -> push flags/CS/IP -> load CS:IP from IVT -> execute HLT -> exit to kvikdos
 The software CPU must implement INT microcode (push/load from IVT) but does NOT
 need to handle any INT semantics — kvikdos does that in userspace after the HLT exit.
 
+## MS-DOS 4.0 build test results on macOS (Step 8)
+
+With the XTulator CPU backend, the following build successfully on macOS:
+- **BUILDIDX** (messages tool): PASS
+- **MASM** (assembler): PASS — 53+ files assembled in MAPPER alone
+- **LIB** (librarian): PASS — MAPPER.LIB created
+- **LINK** (linker): PASS — MSBOOT linked
+- **EXE2BIN**: PASS
+- **DBOF**: PASS
+- **NOSRVBLD** (message compiler): PASS
+- **CL** (C compiler): FAILS with `unsupported int 0x21 ah:87`
+
+The CL failure is NOT a CPU emulation bug — it's a missing DOS API stub in
+kvikdos (INT 21h AH=87h, likely extended memory related). Same limitation
+exists on Linux. All pure-assembly modules (MAPPER, BOOT) build identically.
+
 ## macOS portability notes
 
 - `MAP_ANONYMOUS` works on macOS (synonym for `MAP_ANON`)
