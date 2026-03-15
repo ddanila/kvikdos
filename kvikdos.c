@@ -1846,6 +1846,7 @@ static void init_emu(struct EmuState *emu) {
 static void reset_emu(struct EmuState *emu) {
   void *mem;
   if (emu->kvm_fds.kvm_fd < 0) {
+#ifdef __linux__
     int kvm_fd, vm_fd, vcpu_fd;
     int kvm_run_mmap_size, api_version;
     struct kvm_userspace_memory_region region;
@@ -1866,6 +1867,7 @@ static void reset_emu(struct EmuState *emu) {
       perror("fatal: failed to create KVM vm");
       exit(252);
     }
+#endif /* __linux__ */
     /* If emu_params->mem_mb > 1, then we have allocate more. */
     if ((emu->mem = mem = mmap(NULL, DOS_MEM_LIMIT, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
@@ -1874,6 +1876,7 @@ static void reset_emu(struct EmuState *emu) {
       exit(252);
     }
 
+#ifdef __linux__
     memset(&region, 0, sizeof(region));
     region.slot = 0;
     region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the Linux page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
@@ -1919,6 +1922,16 @@ static void reset_emu(struct EmuState *emu) {
       exit(252);
     }
     emu->kvm_fds.kvm_fd = kvm_fd; emu->kvm_fds.vm_fd = vm_fd; emu->kvm_fds.vcpu_fd = vcpu_fd;
+#else /* !__linux__ */
+    {
+      static struct kvm_run static_kvm_run;
+      emu->kvm_run = &static_kvm_run;
+    }
+    memset(&emu->initial_sregs, 0, sizeof(emu->initial_sregs));
+    emu->kvm_fds.kvm_fd = 0;  /* Mark as initialized (not -1). */
+    emu->kvm_fds.vm_fd = -1;
+    emu->kvm_fds.vcpu_fd = -1;
+#endif /* __linux__ */
   } else {
     mem = emu->mem;
     if (madvise((char*)mem + (((PSP_PARA << 4) + 0xfff) & ~0xfff), DOS_MEM_LIMIT - (((PSP_PARA << 4) + 0xfff) & ~0xfff), MADV_DONTNEED) != 0) {
@@ -2262,6 +2275,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   /* !! Security: close all filehandles except for 0, 1, 2 and kvm_fds, so that read and write from DOS won't be able to touch them. */
 
  set_sregs_regs_and_continue:
+#ifdef __linux__
   if (ioctl(kvm_fds.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
     perror("fatal: KVM_SET_SREGS");
     exit(252);
@@ -2270,9 +2284,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     perror("fatal: KVM_SET_REGS\n");
     exit(252);
   }
+#endif /* __linux__ */
 
   /* !! Trap it if it tries to enter protected mode (cr0 |= 1). Is this possible? */
   for (;;) {
+#ifdef __linux__
     int ret = ioctl(kvm_fds.vcpu_fd, KVM_RUN, 0);
     if (ret < 0) {
       fprintf(stderr, "KVM_RUN failed");
@@ -2286,6 +2302,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       perror("fatal: KVM_GET_REGS");
       exit(252);
     }
+#else /* !__linux__ */
+    /* TODO: call cpu8086_run() here (step 5) */
+    fprintf(stderr, "fatal: software CPU not yet implemented\n");
+    exit(252);
+#endif /* __linux__ */
     if (DEBUG) dump_regs("debug", &regs, &sregs);
 
     switch (run->exit_reason) {
