@@ -103,70 +103,41 @@ needs no ioctl on the software path (regs/sregs are already the CPU state).
 
 **Test**: A trivial .com program exits cleanly on macOS.
 
-### Step 6: Core data movement instructions
+### Step 6: Integrate XTulator CPU core
 
-- `MOV` r/m ↔ r/m, imm (0x88-0x8B, 0xA0-0xA3, 0xB0-0xBF, 0xC6-0xC7)
-- `PUSH`/`POP` registers and segments (0x50-0x5F, 0x06/0E/16/1E/07/17/1F, 0xFF/6, 0x8F/0)
-- `XCHG` (0x86-0x87, 0x90-0x97)
-- `LEA` (0x8D), `LDS`/`LES` (0xC5/0xC4)
-- Segment override prefixes (0x26/2E/36/3E)
-- `CBW`/`CWD` (0x98/0x99)
-- Segment register MOVs (0x8C/0x8E)
+Replace the hand-written opcode switch in `cpu8086.c` with XTulator's CPU core.
 
-**This is the biggest single step** because it requires implementing the ModR/M byte
-decoder with all 16-bit addressing modes: [BX+SI], [BX+DI], [BP+SI], [BP+DI],
-[SI], [DI], [disp16], [BX], plus 8-bit and 16-bit displacements.
+**Substeps:**
+1. Copy `XTulator/XTulator/cpu/cpu.c`, `cpu.h`, `cpuconf.h` into kvikdos (or reference
+   from submodule path).
+2. Remove `#include "i8259.h"` from `cpu.h`. Stub/remove `cpu_interruptCheck()` — kvikdos
+   handles interrupts via IVT → HLT → userspace dispatch, not hardware PIC.
+3. Implement `cpu_read`/`cpu_write`/`cpu_readw`/`cpu_writew` as direct access to kvikdos's
+   flat memory buffer (with `KVM_EXIT_MMIO` for addresses >= `mem_size`).
+4. Implement `port_read`/`port_write`/`port_readw`/`port_writew` to trigger `KVM_EXIT_IO`
+   return (stop execution, fill `kvm_run->io`).
+5. Modify `cpu_exec()` to return on HLT/IO/MMIO instead of running a fixed loop count.
+   Change from `void cpu_exec(CPU_t*, uint32_t)` to returning an exit reason.
+6. Write register sync: `kvm_regs`/`kvm_sregs` → `CPU_t` at entry, `CPU_t` → `kvm_regs`/
+   `kvm_sregs` at exit. Use `makeflagsword`/`decodeflagsword` for flags conversion.
+7. Set `cpuconf.h` to `CPU_8086` mode (strip 80186+ if not needed).
 
-**Test**: `MOV AH, 4Ch` / `INT 21h` works. `guest.com` gets further.
+**Test**: `guest.com` runs completely (INT 21h dispatch, string output, exit).
 
-### Step 7: Arithmetic and flags
+### Step 7: Fix up and test basic programs
 
-- `ADD`/`ADC`/`SUB`/`SBB`/`CMP` (0x00-0x3D, 0x80-0x83 groups)
-- `AND`/`OR`/`XOR`/`TEST`/`NOT`/`NEG` (various opcodes)
-- `INC`/`DEC` (0x40-0x4F, 0xFE-0xFF groups)
-- Flag manipulation: `STC`/`CLC`/`CMC`/`STI`/`CLI`/`CLD`/`STD`/`LAHF`/`SAHF`/`PUSHF`/`POPF`
+With the full XTulator instruction set now wired in, run the existing test programs:
+- `guest.com` — string output, program args, exit
+- `cat.com` — stdin/stdout I/O
+- `malloct.com` / `mallocs.com` — memory allocation
+- `waitkey.com` — keyboard input
+- `printenv.com` — environment access
 
-Eager flag computation: compute CF, ZF, SF, OF, AF, PF after each operation,
-store in `regs.rflags`. Simplest and most correct approach.
+Fix any integration bugs (memory access edge cases, I/O port handling, flag sync issues).
 
-**Test**: Arithmetic + comparisons produce correct flag state.
+**Test**: All .com test programs produce identical output to Linux/KVM.
 
-### Step 8: Control flow
-
-- `JMP` near/short/far (0xE9/0xEB/0xEA)
-- `Jcc` all 16 conditional jumps (0x70-0x7F)
-- `CALL` near/far (0xE8/0x9A, 0xFF/2, 0xFF/3)
-- `RET`/`RETF` (0xC3/0xCB/0xC2/0xCA)
-- `LOOP`/`LOOPE`/`LOOPNE`/`JCXZ` (0xE0-0xE3)
-- `IRET` (0xCF)
-
-**Test**: `guest.com` runs completely (uses LODSB, CMP, JE, JMP, RET, INT).
-
-### Step 9: String operations
-
-- `MOVSB`/`MOVSW` (0xA4-0xA5)
-- `STOSB`/`STOSW` (0xAA-0xAB)
-- `LODSB`/`LODSW` (0xAC-0xAD)
-- `CMPSB`/`CMPSW` (0xA6-0xA7)
-- `SCASB`/`SCASW` (0xAE-0xAF)
-- `REP`/`REPE`/`REPNE` prefixes (0xF2/0xF3)
-
-Heavily used by C runtime (memcpy, memset, strlen) and by MASM/LINK.
-
-**Test**: `cat.com` works (reads stdin, writes stdout).
-
-### Step 10: Multiply, divide, shifts, remaining
-
-- `MUL`/`IMUL`/`DIV`/`IDIV` (0xF6-0xF7 groups)
-- `SHL`/`SHR`/`SAR`/`ROL`/`ROR`/`RCL`/`RCR` (0xD0-0xD3, 0xC0-0xC1)
-- `AAA`/`AAS`/`AAM`/`AAD`/`DAA`/`DAS` (BCD)
-- `XLAT` (0xD7)
-- `IN`/`OUT` (0xE4-0xE7, 0xEC-0xEF)
-- `INT 3` (0xCC), `INTO` (0xCE)
-
-**Test**: `malloct.com` / `mallocs.com` run correctly.
-
-### Step 11: Integration test with real build tools
+### Step 8: Integration test with real build tools
 
 Run the actual MS-DOS 4.0 build toolchain under the software CPU:
 MASM → CL → LINK → LIB. Fix missing or buggy instructions iteratively.
@@ -174,60 +145,89 @@ Compare output binaries to KVM-produced ones (should be byte-identical).
 
 **Test**: `make` in the parent project produces identical binaries on macOS.
 
-### Step 12: Makefile and build system
+### Step 9: Build system and CI
 
-- Detect platform via `uname -s`
-- Linux: build as before (KVM, single-file compile)
-- macOS: compile `cpu8086.c` + `kvikdos.c`, link with `clang`
-- Handle `MAP_ANONYMOUS`/`MAP_ANON`, `madvise` portability
+- Makefile already detects platform via `uname -s` (done in step 5)
+- Ensure XTulator CPU files are compiled on non-Linux
+- Handle any remaining portability issues (`MAP_ANONYMOUS`/`MAP_ANON`, `madvise`)
+- Add macOS to CI if desired
 - `make test` works on both platforms
 
 **Test**: `make && make run` works on macOS.
 
-## 8086tiny as CPU core
+## XTulator as CPU core
 
-We use [8086tiny](https://github.com/adriancable/8086tiny) (MIT license, forked to
-ddanila/8086tiny) as the foundation for the software CPU backend. It provides a complete,
-proven 8086 instruction set implementation in ~760 lines of C.
+We use the CPU core from [XTulator](https://github.com/mikechambers84/XTulator) (GPLv2,
+forked to [ddanila/XTulator](https://github.com/ddanila/XTulator)) as the foundation for
+the software CPU backend. XTulator is a portable 80186 PC emulator by Mike Chambers
+(same author as fake86). Its CPU core is ~3,300 lines in 2 files (`cpu.c` + `cpu.h`) with
+very clean separation from peripherals.
 
-### What we use from 8086tiny
-- Instruction decode loop and opcode translation tables
-- ModR/M decoder, all addressing modes
-- All arithmetic/logic with correct flag computation
-- String operations with REP prefixes
+### Why XTulator over alternatives
+- **Cleanest extraction**: CPU core is 2 self-contained files with only 6 external
+  function dependencies (`cpu_read`, `cpu_write`, `port_read`, `port_write`, `cpu_readw`,
+  `cpu_writew` + `i8259_nextintr` for interrupt checks).
+- **No global state**: All functions take `CPU_t*` as first argument.
+- **Full 8086 coverage**: All 256 primary opcodes + 80186 extensions (PUSHA, POPA, ENTER,
+  LEAVE, PUSH imm, IMUL imm, BOUND, INS, OUTS).
+- **Battle-tested**: Same CPU core lineage as fake86.
+- **Small**: ~3,300 lines total vs. libx86emu's ~13,100 lines.
+- **GPLv2**: Compatible with kvikdos's GPL >=2.0.
+
+### What we use from XTulator
+- `cpu_exec()` main decode/execute loop (the big 256-case switch)
+- `CPU_t` struct with register/flag state
+- ModR/M decoder with all 16-bit addressing modes
+- All arithmetic/logic with correct flag computation (individual flag bytes +
+  `makeflagsword`/`decodeflagsword` macros)
+- String operations with REP/REPNE prefixes
 - MUL/DIV, shifts/rotates, BCD instructions
+- `cpu_intcall()` INT microcode
 
 ### What we strip/adapt
-- **BIOS lookup tables**: 8086tiny loads decode tables from a BIOS binary at runtime.
-  We extract these tables and embed them as C `const` arrays, eliminating the file dependency.
-- **Register model**: 8086tiny stores registers at `mem[0xF0000]`. We copy registers
-  between kvikdos's `kvm_regs`/`kvm_sregs` and 8086tiny's memory-mapped format at the
-  `cpu8086_run()` boundary.
-- **Peripherals**: Strip keyboard, timer, CGA/Hercules, SDL, disk I/O — kvikdos handles
-  all of this via its existing INT/MMIO handlers.
-- **Main loop exit**: Instead of running until `CS:IP == 0:0`, exit on HLT (for INT
-  dispatch), I/O port access, or MMIO to report back to kvikdos.
+- **Memory access**: Replace `cpu_read`/`cpu_write` with direct access to kvikdos's
+  flat memory buffer. For addresses >= `mem_size`, return `KVM_EXIT_MMIO`.
+- **Port I/O**: Replace `port_read`/`port_write` with `KVM_EXIT_IO` returns, letting
+  kvikdos handle port I/O the same way as the KVM backend.
+- **Interrupt controller**: Remove `i8259_nextintr()` dependency. kvikdos doesn't use
+  hardware interrupt injection; all INTs go through IVT → HLT → userspace dispatch.
+- **Register sync**: Keep `CPU_t` internally; copy between `CPU_t` and
+  `kvm_regs`/`kvm_sregs` at each `cpu8086_run()` entry/exit boundary.
+  Individual flag bytes ↔ packed `rflags` via existing `makeflagsword`/`decodeflagsword`.
+- **Main loop exit**: Modify `cpu_exec()` to return on HLT (for INT dispatch),
+  I/O port access, or MMIO, instead of running a fixed loop count.
+- **Remove includes**: Strip `i8259.h`, `config.h`, `debuglog.h` dependencies.
+- **CPU variant**: Set `cpuconf.h` to `CPU_8086` or `CPU_80186` mode.
 
 ### Alternatives considered
+- **8086tiny** (MIT): Complete 8086 in ~760 lines, but tightly coupled to BIOS binary
+  lookup tables and memory-mapped register model. Harder to extract cleanly.
+- **libx86emu** (BSD): Very mature, embeddable API, but 5x larger (~13K lines) and its
+  page-table memory model adds overhead we don't need.
+- **fake86** (GPLv2): Same author as XTulator, but uses global state (no CPU_t* param)
+  and has hardcoded VGA memory ranges in cpu.c. XTulator is the cleaner evolution.
 - **i8086emu** (TheFox): MIT, but written in PHP — not usable in a C project.
-- **fake86**: GPLv2 — incompatible with kvikdos's GPL >=2.0 in spirit but adds
-  copyleft complexity; also ~2500 lines and tightly coupled to its own PC emulation.
-- **Writing from scratch**: ~2000 lines of work with subtle flag/decode bugs to shake out.
-  8086tiny is battle-tested (runs Windows 3.0, AutoCAD) and saves significant effort.
+- **Blink** (ISC): x86-64 focused, massive codebase (~7K stars), overkill for 8086.
 
 ## Risk areas
 
-- **ModR/M decoder correctness** (step 6): all 256 addressing mode combinations.
-  Use Intel 8086 manual or reference implementation (fake86, 8086tiny) to verify.
-- **Flag computation** (step 7): AF, OF for SUB vs CMP edge cases.
-  Test with known flag-dependent code paths in the build tools.
-- **Segment wrapping**: real 8086 wraps at 1MB. Unlikely to matter for conventional
-  memory programs, but needs handling for correctness.
+- **XTulator exec loop modification** (step 6): changing `cpu_exec()` from a fixed-loop
+  void function to one that returns on HLT/IO/MMIO. The main risk is missing an exit
+  point or breaking the prefix handling (segment overrides, REP).
+- **Register sync correctness** (step 6): mapping between `CPU_t` individual flag bytes
+  and `kvm_regs.rflags` packed word. The `makeflagsword`/`decodeflagsword` macros already
+  exist in XTulator, but edge cases around reserved flag bits (bit 1 always set) need care.
+- **Memory access boundary**: XTulator's `cpu_read`/`cpu_write` must return MMIO exit for
+  addresses >= 640KB. Need to handle this mid-instruction (e.g. during a `MOV` that
+  crosses the boundary).
+- **Segment wrapping**: real 8086 wraps at 1MB. XTulator handles this already via
+  `& 0xFFFFF` masking in `segbase()`.
 - **Self-modifying code**: works naturally (both backends read from same `mem` buffer).
 
 ## References
 
 - Intel 8086/8088 User's Manual (instruction encoding tables)
-- [8086tiny](https://github.com/adriancable/8086tiny) — ~500 lines of core 8086 logic
-- [fake86](https://github.com/rubbermallet/fake86) — more complete, ~2500 lines
+- [XTulator](https://github.com/mikechambers84/XTulator) — portable 80186 emulator (GPLv2)
+- [fake86](https://github.com/mikechambers84/fake86) — predecessor by same author
+- [libx86emu](https://github.com/wfeldt/libx86emu) — embeddable x86 emulator (BSD)
 - kvikdos `mini_kvm.h` — portable struct definitions
