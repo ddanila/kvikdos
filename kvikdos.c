@@ -452,6 +452,7 @@ typedef struct EmuParams {
   char is_hlt_ok;
   unsigned mem_mb;
   const char *hlt_dump_filename;
+  unsigned char dos_version;  /* Major DOS version reported via INT 21h/AH=30h and PSP+0x40. Default: 4. */
 } EmuParams;
 
 typedef struct ParsedCmdArgs {
@@ -521,6 +522,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   cmd_args.emu_params.mem_mb = 1;
   cmd_args.emu_params.is_hlt_ok = 0;
   cmd_args.emu_params.hlt_dump_filename = NULL;
+  cmd_args.emu_params.dos_version = 5;  /* Default: 5 (kvikdos upstream default). Override with --dos-version=N. */
   is_kvm_check = 0;
   is_drive_specified = 0;
   while (argv[0]) {
@@ -529,6 +531,13 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       --argv; break;
     } else if (arg[1] == '-' && arg[2] == '\0') {
       break;
+    } else if (0 == strncmp(arg, "--dos-version=", 14)) {
+      int char_count = 0, v = 0;
+      if (sscanf(arg + 14, "%d%n", &v, &char_count) < 1 || arg[14 + char_count] != '\0' || v < 1 || v > 9) {
+        fprintf(stderr, "fatal: invalid --dos-version value (expected 1-9): %s\n", arg);
+        exit(1);
+      }
+      cmd_args.emu_params.dos_version = (unsigned char)v;
     } else if (0 == strcmp(arg, "--hlt-ok")) {
       cmd_args.emu_params.is_hlt_ok = 1;
     } else if (0 == strcmp(arg, "--env")) {
@@ -1260,7 +1269,7 @@ static const unsigned char fixed_exepack_stub[283] = {
  * detect_dos_executable_program. Returns the Program Segment Prefix (PSP)
  * address.
  */
-static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs, unsigned short *block_size_para_out) {
+static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs, unsigned short *block_size_para_out, unsigned char dos_version) {
 #define MEMSIZE_AVAILABLE_PARA ((DOS_MEM_LIMIT >> 4) - PSP_PARA - 0x10 /* PSP */)
   const unsigned memsize_available_para = MEMSIZE_AVAILABLE_PARA;
   char *psp;
@@ -1440,7 +1449,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   psp[5] = (char)0xf4;  /* hlt instruction; this is machine code to jump to the CP/M dispatcher. */
   *(unsigned short*)(psp + 0x2c) = ENV_PARA;
   *(unsigned short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
-  *(unsigned short*)(psp + 0x40) = 5;  /* DOS version number (DOSBox also reports 5). */
+  *(unsigned short*)(psp + 0x40) = dos_version;  /* DOS version number. See also: INT 21h/AH=30h. */
   *(unsigned short*)(psp + 0x50) = 0x21cd;  /* `int 0x21' opcode. */
   *(unsigned short*)(psp + 0x32) = 20;  /* `Number of bytes in JFT. */
   *(unsigned*)(psp + 0x34) = 0x18 | PSP_PARA << 16;  /* `Far pointer to JFT. */
@@ -2139,12 +2148,20 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
    */
   *(unsigned short*)((char*)mem + 0x410) = 0x22;  /* BIOS equipment flags. https://stanislavs.org/helppc/int_11.html */
   ((char*)mem)[(INT_HLT_PARA << 4) - 1] = (char)0xcb;  /* `retf' opcode used by country case map. */
+  /* Collating sequence table at 0x0420..0x0521 (before hlt table at 0x0540), for INT 21h/AH=65h/AL=06h.
+   * Country info copy at 0x0522..0x0539 (sizeof country_info == 0x18), for INT 21h/AH=65h/AL=01h.
+   * These addresses are in the KVM readonly-guest slot and are re-initialized on each run. */
+  { unsigned char *p = (unsigned char*)mem + 0x0420; unsigned i;
+    *(unsigned short*)p = 0x0100;  /* Length = 256. */
+    for (i = 0; i < 256; ++i) p[2 + i] = (unsigned char)i;  /* Identity collating map. */
+  }
+  memcpy((char*)mem + 0x0522, &country_info, sizeof(country_info));
 
   /*memcpy(initial_sregs, &sregs, sizeof(sregs));*/  /* Not completely 0, but sregs.Xs.selector is 0. */
   sregs.fs.selector = sregs.gs.selector = ENV_PARA;  /* Random value after magic interrupt table. */
 
   memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
-  { char *psp_args = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4))) + 0x80;
+  { char *psp_args = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4)), emu_params->dos_version) + 0x80;
     if (args) {
       copy_args_to_dos_args(psp_args, args);
       args = NULL;  /* DOS exec() shouldn't copy them later. */
@@ -2398,7 +2415,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const unsigned char al = (unsigned char)regs.rax;
             if (DEBUG || DEBUG_INTVEC) fprintf(stderr, "debug: get DOS version\n");
             had_get_ints |= 8;
-            *(unsigned short*)&regs.rax = 5 | 0 << 8;  /* 5.0. */
+            *(unsigned short*)&regs.rax = emu_params->dos_version | 0 << 8;  /* Major.minor DOS version. */
             *(unsigned short*)&regs.rbx = al == 1 ? 0x1000 :  /* DOS in HMA. */
                 0xff00;  /* MS-DOS with high 8 bits of OEM serial number in BL. */
             *(unsigned short*)&regs.rcx = 0;  /* Low 16 bits of OEM serial number in CX. */
@@ -3434,6 +3451,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             } else {
               goto fatal_int;
             }
+          } else if (ah == 0x65) {  /* Get extended country info (NLS). */
+            /* Caller provides ES:DI = buffer, CX = buffer size. Returns CF=0, buffer filled. */
+            const unsigned char al = (unsigned char)regs.rax;
+            char * const buf = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);
+            /* !! Security: check bounds. */
+            buf[0] = (char)al;
+            if (al == 0x01) {  /* General country info: far ptr to 34-byte country_info copy at 0x0522. */
+              *(unsigned short*)(buf + 1) = 0x0522;  *(unsigned short*)(buf + 3) = 0x0000;
+            } else if (al == 0x02 || al == 0x04 || al == 0x05 || al == 0x06 || al == 0x07) {
+              /* Uppercase (02), filename uppercase (04), filename chars (05),
+               * collating sequence (06), DBCS (07): return identity table at 0x0420. */
+              *(unsigned short*)(buf + 1) = 0x0420;  *(unsigned short*)(buf + 3) = 0x0000;
+            } else {
+              goto fatal_int;
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x66) {  /* Get/set global code page. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 1) {
@@ -3553,6 +3586,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else {
             goto fatal_int;
           }
+        } else if (int_num == 0x12) {  /* Get conventional memory size (in KB). */
+          *(unsigned short*)&regs.rax = DOS_MEM_LIMIT >> 10;  /* 640 KB. */
         } else if (int_num == 0x11) {  /* Get BIOS equipment flags. */
           *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x410);
         } else if (int_num == 0x2f) {  /* Installation checks. */
@@ -3567,6 +3602,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (*(unsigned short*)&regs.rax == 0xfb42) {
           } else if (*(unsigned short*)&regs.rax == 0xfb43) {
 #endif
+          } else if (ah == 0xb7) {  /* APPEND: return "not installed / disabled" for any sub-function. */
+            *(unsigned short*)&regs.rax = 0;
+            *(unsigned short*)&regs.rbx = 0;  /* AL=07h (get flags): BX=0 means no flags set. */
           } else if (ah == 0x12 && al == 0x2e) {  /* MultDOS MSG_RETRIEVAL (DOS 4.0 internal, MULT.INC sub 46). */
             /* COMMAND.COM calls this during init to get/set parse and critical error message handler
              * addresses (DL selects sub-subfunction).  GET: return ES:DI=0:0 (no existing handler).
@@ -3584,13 +3622,17 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (ah == 0x88) {  /* Get extended memory (XMS) size. */
             *(unsigned short*)&regs.rax = 0;  /* No extended memory. */
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0xc1) {  /* Get EBDA segment address. */
+            *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1: no EBDA. */
           } else {
             goto fatal_uic;
           }
-        } else if (int_num == 0x67) {  /* Various. */
+        } else if (int_num == 0x67) {  /* EMS (Expanded Memory) or VCPI. */
           const unsigned short ax = (unsigned short)regs.rax;
           if (ax == 0xde00) {  /* VCPI installation check. http://mirror.cs.msu.ru/oldlinux.org/Linux.old/docs/interrupts/int-html/rb-7491.htm */
             /* Doing nothing means it's not installed. */
+          } else if (ah >= 0x40 && ah <= 0x62) {  /* EMS functions: return "EMM not present" error. */
+            *(unsigned char*)((unsigned char*)&regs.rax + 1) = 0x86;  /* AH = 0x86: EMM not present. */
           } else {
             goto fatal_uic;
           }
@@ -3684,6 +3726,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else if (addr == 0xa003e && mmio_len == 2 && !run->mmio.is_write) {
           /* Microsoft Macro Assembler 6.00B driver masm.exe. */
           *(unsigned short*)run->mmio.data = 0;
+        } else if (addr >= 0xa0000 && addr < 0x110000 && !run->mmio.is_write) {
+          /* High memory reads (DOS/BIOS ROM area): return 0 for all fields.
+           * Needed for MEM.EXE which reads INVARS (INT 21h/AH=52h) ExtendedMemory
+           * from segment 0xFFF0 and expects 0 to skip extended memory display. */
+          memset(run->mmio.data, 0, mmio_len);
         } else if (addr == 0x501 && addr + mmio_len <= 0x504 && run->mmio.is_write) {
           /* Microsoft Macro Assembler 1.00 m.exe only writes byte at 0x501. */
           memcpy((char*)mem + addr, run->mmio.data, mmio_len);
