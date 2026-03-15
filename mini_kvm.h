@@ -1,16 +1,23 @@
+/*
+ * mini_kvm.h: portable KVM struct definitions for kvikdos.
+ *
+ * On Linux, this provides KVM ioctl constants and struct layouts matching
+ * <linux/kvm.h>. On non-Linux platforms (macOS, etc.), only the struct
+ * definitions and exit-reason constants are provided — sufficient for the
+ * software CPU backend to use the same data types as the KVM backend.
+ */
+
 #include <stdint.h>  /* E.g. uint64_t. */
-#include <sys/ioctl.h>  /* _IO(...). */
 
 typedef uint8_t __u8;
 typedef uint16_t __u16;
 typedef uint32_t __u32;
 typedef uint64_t __u64;
 
-#define KVM_API_VERSION 12
-#define KVMIO 0xAE
-
 /* Architectural interrupt line count. */
 #define KVM_NR_INTERRUPTS 256
+
+/* --- Struct definitions (portable, used by both KVM and software CPU) --- */
 
 struct kvm_regs {
         __u64 rax, rbx, rcx, rdx;
@@ -21,13 +28,13 @@ struct kvm_regs {
 };
 
 struct kvm_segment {
-        __u64 base; 
+        __u64 base;
         __u32 limit;
         __u16 selector;
         __u8  type;
         __u8  present, dpl, db, s, l, g, avl;
         __u8  unusable;
-        __u8  padding; 
+        __u8  padding;
 };
 
 struct kvm_dtable {
@@ -46,15 +53,8 @@ struct kvm_sregs {
         __u64 interrupt_bitmap[(KVM_NR_INTERRUPTS + 63) / 64];
 };
 
-struct kvm_userspace_memory_region {
-        __u32 slot;
-        __u32 flags;
-        __u64 guest_phys_addr;
-        __u64 memory_size; /* bytes */
-        __u64 userspace_addr; /* start of the userspace allocated memory */
-};
-
-/* for KVM_RUN, returned by mmap(vcpu_fd, offset=0) */
+/* for KVM_RUN, returned by mmap(vcpu_fd, offset=0) on Linux.
+ * On non-Linux, allocated as a plain struct for software CPU exit info. */
 __extension__ struct kvm_run {
 	/* in */
 	__u8 request_interrupt_window;
@@ -227,6 +227,31 @@ __extension__ struct kvm_run {
 	} s;
 };
 
+/* --- Exit reason constants (portable, used by both backends) --- */
+
+#define KVM_EXIT_IO               2
+#define KVM_EXIT_HLT              5
+#define KVM_EXIT_MMIO             6
+#define KVM_EXIT_SHUTDOWN         8
+#define KVM_EXIT_INTERNAL_ERROR   17
+
+/* --- KVM ioctl constants (Linux only) --- */
+
+#ifdef __linux__
+
+#include <sys/ioctl.h>  /* _IO(...). */
+
+#define KVM_API_VERSION 12
+#define KVMIO 0xAE
+
+struct kvm_userspace_memory_region {
+        __u32 slot;
+        __u32 flags;
+        __u64 guest_phys_addr;
+        __u64 memory_size; /* bytes */
+        __u64 userspace_addr; /* start of the userspace allocated memory */
+};
+
 #define KVM_GET_API_VERSION       _IO(KVMIO,   0x00)
 #define KVM_CREATE_VM             _IO(KVMIO,   0x01) /* returns a VM fd */
 #define KVM_SET_USER_MEMORY_REGION _IOW(KVMIO, 0x46, \
@@ -242,8 +267,4 @@ __extension__ struct kvm_run {
 #define KVM_MEM_LOG_DIRTY_PAGES (1UL << 0)
 #define KVM_MEM_READONLY        (1UL << 1)
 
-#define KVM_EXIT_IO               2
-#define KVM_EXIT_HLT              5
-#define KVM_EXIT_MMIO             6
-#define KVM_EXIT_SHUTDOWN         8   
-#define KVM_EXIT_INTERNAL_ERROR   17
+#endif /* __linux__ */

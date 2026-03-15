@@ -39,11 +39,7 @@
 #include <termios.h>
 #include <unistd.h>
 
-#ifdef USE_MINI_KVM  /* For systems with a broken linux/kvm.h. */
-#  include "mini_kvm.h"
-#else
-#  include <linux/kvm.h>
-#endif
+#include "mini_kvm.h"
 
 #ifndef DEBUG
 #define DEBUG 0
