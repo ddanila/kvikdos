@@ -2684,6 +2684,53 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (DEBUG) fprintf(stderr, "debug: dos_open(%s) dos_fd=%d\n", p, fd);
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             *(unsigned short*)&regs.rax = fd;
+          } else if (ah == 0x6c) {  /* Extended open/create (DOS 4.0+). */
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);  /* DS:SI = filename. */
+            const unsigned short open_mode = *(unsigned short*)&regs.rbx;  /* BL bits 0-2 = access mode. */
+            const unsigned short action = *(unsigned short*)&regs.rdx;  /* Action flags: bit 0 = open existing, bit 1 = truncate existing, bit 4 = create if not exists. */
+            int flags;
+            unsigned short cx_result;
+            int fd;
+            const char *linux_filename;
+            char *linux_lastc;
+            if (DEBUG) fprintf(stderr, "debug: ext_open(%s) mode=0x%x action=0x%x\n", p, open_mode, action);
+            linux_filename = get_linux_filename_r(p, dir_state, fnbuf, &linux_lastc);
+            if (DEBUG) fprintf(stderr, "debug: ext_open(%s) linux_filename=(%s)\n", p, linux_filename);
+            {
+              struct stat st;
+              int exists = (stat(linux_filename, &st) == 0);
+              if (exists) {
+                if (action & 0x02) {  /* Truncate if exists. */
+                  flags = (open_mode & 3) | O_TRUNC;
+                  cx_result = 3;  /* File existed, was truncated. */
+                } else if (action & 0x01) {  /* Open if exists. */
+                  flags = (open_mode & 3);
+                  cx_result = 1;  /* File existed, was opened. */
+                } else {
+                  *(unsigned short*)&regs.rax = 80;  /* File exists. */
+                  goto error_on_21;
+                }
+              } else {
+                if (action & 0x10) {  /* Create if not exists. */
+                  flags = (open_mode & 3) | O_CREAT;
+                  cx_result = 2;  /* File did not exist, was created. */
+                } else {
+                  *(unsigned short*)&regs.rax = 2;  /* File not found. */
+                  goto error_on_21;
+                }
+              }
+            }
+            if ((fd = open(linux_filename, flags, 0644)) < 0) goto error_from_linux;
+            if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);
+            fd = map_fd_open(fd);
+            if ((fd + 0U) >> 16) {
+              *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
+              goto error_on_21;
+            }
+            if (DEBUG) fprintf(stderr, "debug: ext_open(%s) dos_fd=%d cx_result=%d\n", p, fd, cx_result);
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            *(unsigned short*)&regs.rax = fd;
+            *(unsigned short*)&regs.rcx = cx_result;
           } else if (ah == 0x57) {  /* Get/set file date and time using handle. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al < 2 ) {
@@ -3728,6 +3775,20 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               /* Uppercase (02), filename uppercase (04), filename chars (05),
                * collating sequence (06), DBCS (07): return identity table at 0x0420. */
               *(unsigned short*)(buf + 1) = 0x0420;  *(unsigned short*)(buf + 3) = 0x0000;
+            } else if (al == 0x20) {  /* Capitalize character in DL. */
+              unsigned char dl = (unsigned char)regs.rdx;
+              if (dl >= 'a' && dl <= 'z') dl -= 32;
+              *(unsigned char*)&regs.rdx = dl;
+            } else if (al == 0x21) {  /* Capitalize string (DS:DX = ASCIZ, CX = length). */
+              char *s = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+              unsigned short len = *(unsigned short*)&regs.rcx;
+              unsigned short i;
+              for (i = 0; i < len && s[i]; i++) {
+                if ((unsigned char)s[i] >= 'a' && (unsigned char)s[i] <= 'z') s[i] -= 32;
+              }
+            } else if (al == 0x22) {  /* Capitalize ASCIZ string (DS:DX = ASCIZ). */
+              char *s = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+              while (*s) { if ((unsigned char)*s >= 'a' && (unsigned char)*s <= 'z') *s -= 32; s++; }
             } else if (al == 0x23) {  /* Determine if character represents yes/no response. */
               /* DL = character to test. Returns AX: 0=Yes, 1=No, 2=neither. */
               const unsigned char dl = (unsigned char)regs.rdx;
