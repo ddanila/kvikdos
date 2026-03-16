@@ -2856,6 +2856,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 get_int_num == 0x03 ||  /* DEBUG.COM saves/restores INT 03 (breakpoint). */
                 get_int_num == 0x01 ||  /* DEBUG.COM saves/restores INT 01 (single-step). */
                 get_int_num == 0x02 ||  /* DEBUG.COM saves/restores INT 02 (NMI). */
+                get_int_num == 0x21 ||  /* ASSIGN.COM saves INT 21 to hook it. */
+                get_int_num == 0x25 ||  /* ASSIGN.COM saves/restores INT 25 (absolute disk read). */
+                get_int_num == 0x26 ||  /* ASSIGN.COM saves/restores INT 26 (absolute disk write). */
+                get_int_num == 0x2f ||  /* GRAFTABL.COM checks INT 2F (multiplex) for TSR presence. */
                 ((had_get_ints & 0x10) && (get_int_num - 0x34 + 0U <= 0x3d - 0x34 + 0U || get_int_num == 0x02 || get_int_num == 0x1b)) ||  /* JWasm 2.11a jwasmr.exe */
                 ((had_get_ints & 2) && (get_int_num == 0x1b || get_int_num == 0x3f)) ||  /* Borland Turbo C++ 1.01 compiler tcc.exe, Borland C++ 2.0 complier bcc.exe */
                0) {
@@ -3891,6 +3895,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (*(unsigned short*)&regs.rax == 0xfb42) {
           } else if (*(unsigned short*)&regs.rax == 0xfb43) {
 #endif
+          } else if (ah == 0x06) {  /* ASSIGN installation check. */
+            *(unsigned char*)&regs.rax = 0;  /* Not installed. */
           } else if (ah == 0xb7) {  /* APPEND: return "not installed / disabled" for any sub-function. */
             *(unsigned short*)&regs.rax = 0;
             *(unsigned short*)&regs.rbx = 0;  /* AL=07h (get flags): BX=0 means no flags set. */
