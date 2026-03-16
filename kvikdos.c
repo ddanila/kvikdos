@@ -3983,9 +3983,30 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           run->mmio.data[0] = 0xfc;  /* Machine ID is regular OC (0xfc). Same as default in src/ints/bios.cpp in DOSBox 0.74. */
         } else if (addr - 0xffff5U < 8U && !run->mmio.is_write && mmio_len == 1) {  /* JWasm 2.11a jwasmr.exe */
           run->mmio.data[0] = "01/01/92"[addr - 0xffff5U];  /* System BIOS date, same as default in src/ints/bios.cpp in DOSBox 0.74. */
-        } else if (addr == 0xfff7e && !run->mmio.is_write && mmio_len == 2) {  /* Reading the first MCB pointer in INVARS (see int 0x21 call with ah == 0x52). Used by Microsoft Macro Assembler 6.00B driver masm.exe. */
-          *(unsigned short*)run->mmio.data = PROGRAM_MCB_PARA;
-          had_get_first_mcb = 1;
+        } else if (addr >= 0xfff7e && addr + mmio_len <= 0xfffb4 && !run->mmio.is_write) {
+          /* INVARS (List of Lists) region: 0xFFF7E..0xFFFB4.
+           * INT 21h/52h returns ES:BX = 0xFFF0:0x0080 (linear 0xFFF80).
+           * INVARS-2 (0xFFF7E) = first MCB segment.
+           * INVARS+0x22 (0xFFFA2) = NUL device header (18 bytes, terminates chain).
+           * MEM.EXE /PROGRAM walks the device driver chain from INVARS+0x22.
+           * Without a proper NUL header (FFFF:FFFF terminator), MEM loops forever. */
+          static const unsigned char invars_data[0x36] = {
+            /* -0x02: first MCB segment (little-endian) */
+            (unsigned char)PROGRAM_MCB_PARA, (unsigned char)(PROGRAM_MCB_PARA >> 8),
+            /* +0x00..+0x21: DPBP, SFT, CLOCK$, CON, max sector size, etc. — all zeros */
+            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+            0,0,
+            /* +0x22: NUL device header (18 bytes) */
+            0xff,0xff,0xff,0xff,  /* next device = FFFF:FFFF (end of chain) */
+            0x04,0x80,            /* attribute: character device + NUL */
+            0x00,0x00,            /* strategy entry (unused) */
+            0x00,0x00,            /* interrupt entry (unused) */
+            'N','U','L',' ',' ',' ',' ',' '  /* device name */
+          };
+          unsigned ofs = addr - 0xfff7e;
+          memcpy(run->mmio.data, invars_data + ofs, mmio_len);
+          if (addr == 0xfff7e) had_get_first_mcb = 1;
         } else if (addr < 0x400 && run->mmio.is_write && addr + mmio_len <= 0x400 && ((mmio_len == 2 && (addr & 1) == 0) || (mmio_len == 4 && (addr & 3) == 0))) {  /* Set interrupt vector directly (not via int 0x21 call with ah == 0x25). */
           /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe */
           const unsigned char set_int_num = addr >> 2;
