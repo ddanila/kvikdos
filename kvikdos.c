@@ -1020,6 +1020,27 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
 #define is_linear_byte_user_writable(linear) ((linear) - (ENV_PARA << 4) < (DOS_MEM_LIMIT - (ENV_PARA << 4)))
 
 #define FINDFIRST_MAGIC 0xd5ba1ad0U
+#define FCB_KV_MAGIC 0x4B56U  /* Magic value stored in FCB reserved area to identify kvikdos-opened FCBs. */
+
+/* Convert FCB (drive + 8.3 name) to a DOS path like "C:FILENAME.EXT".
+ * fcb points to the 12-byte FCB header (drive, 8-char name, 3-char ext).
+ * out must be at least 14 bytes. Returns out.
+ */
+static char *fcb_to_dos_path(const char *fcb, char *out, char default_drive) {
+  char *p = out;
+  int i;
+  unsigned char drv = (unsigned char)fcb[0];
+  if (drv == 0) drv = default_drive - 'A' + 1;
+  *p++ = 'A' + drv - 1;
+  *p++ = ':';
+  for (i = 0; i < 8 && fcb[1 + i] != ' '; i++) *p++ = fcb[1 + i];
+  if (fcb[9] != ' ') {
+    *p++ = '.';
+    for (i = 0; i < 3 && fcb[9 + i] != ' '; i++) *p++ = fcb[9 + i];
+  }
+  *p = '\0';
+  return out;
+}
 
 /* --- Memory allocation helpers. */
 
@@ -1483,6 +1504,56 @@ static void dump_regs(const char *prefix, const struct kvm_regs *regs, const str
           R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R16(sp), R16(bp), *(unsigned*)&regs->rflags,
           S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
   fflush(stdout);
+}
+
+/* Parse a command-line argument into an FCB (drive + 8.3 name).
+ * Fills fcb[0..11]. Returns pointer past the parsed argument.
+ * Drive byte is 0 for default drive, 1=A, 2=B, etc.
+ */
+static const char *parse_arg_to_psp_fcb(const char *p, char *fcb) {
+  int i;
+  /* Skip leading separators. */
+  while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';' || *p == '=' || *p == '+') ++p;
+  memset(fcb, 0, 16);  /* Clear the FCB area (drive + name + ext + padding). */
+  memset(fcb + 1, ' ', 11);  /* Space-fill name and extension. */
+  if (*p == '\0' || *p == '\r') return p;
+  /* Parse drive letter. */
+  if (p[0] != '\0' && (p[0] & ~32) >= 'A' && (p[0] & ~32) <= 'Z' && p[1] == ':') {
+    fcb[0] = (p[0] & ~32) - 'A' + 1;
+    p += 2;
+  }  /* else fcb[0] stays 0 = default drive. */
+  /* Find the last path separator to skip directory components. */
+  { const char *last_sep = NULL, *scan = p;
+    while (*scan && *scan != ' ' && *scan != '\t' && *scan != '\r') {
+      if (*scan == '\\' || *scan == '/') last_sep = scan;
+      ++scan;
+    }
+    if (last_sep) p = last_sep + 1;
+  }
+  /* Parse filename (up to 8 chars). */
+  for (i = 0; i < 8; ++i) {
+    char c = *p;
+    if (c == '\0' || c == '.' || c == ' ' || c == '\t' || c == '\r' || c == '/' || c == '\\') break;
+    if (c == '*') { memset(fcb + 1 + i, '?', 8 - i); ++p; i = 8; break; }
+    fcb[1 + i] = (c >= 'a' && c <= 'z') ? (c & ~32) : c;
+    ++p;
+  }
+  /* Skip remaining name chars if name was longer than 8. */
+  while (*p && *p != '.' && *p != ' ' && *p != '\t' && *p != '\r') ++p;
+  /* Parse extension (up to 3 chars). */
+  if (*p == '.') {
+    ++p;
+    for (i = 0; i < 3; ++i) {
+      char c = *p;
+      if (c == '\0' || c == ' ' || c == '\t' || c == '\r' || c == '.' || c == '/' || c == '\\') break;
+      if (c == '*') { memset(fcb + 9 + i, '?', 3 - i); ++p; i = 3; break; }
+      fcb[9 + i] = (c >= 'a' && c <= 'z') ? (c & ~32) : c;
+      ++p;
+    }
+  }
+  /* Skip to next separator (consume rest of this argument). */
+  while (*p && *p != ' ' && *p != '\t' && *p != '\r') ++p;
+  return p;
 }
 
 static void copy_args_to_dos_args(char *p, const char* const *args) {
@@ -2192,6 +2263,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       *psp_args++ = (char)size;
       memcpy(psp_args, args_str, size);
       psp_args[size] = '\r';
+    }
+    /* Fill PSP default FCBs at 0x5C and 0x6C by parsing the command tail. */
+    { char *psp = (char*)mem + (PSP_PARA << 4);
+      const char *cmd_tail = psp + 0x81;  /* Command tail starts at PSP+0x81 (first char after length byte). */
+      cmd_tail = parse_arg_to_psp_fcb(cmd_tail, psp + 0x5c);
+      parse_arg_to_psp_fcb(cmd_tail, psp + 0x6c);
     }
   }
   if (img_fd >= 0) close(img_fd);
@@ -3243,6 +3320,134 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             /* Microsoft Macro Assembler 6.00B driver masm.exe. */
             (*(unsigned short*)&regs.rbx) = 0x80;
             SET_SREG(es, 0xfff0);
+          } else if (ah == 0x11 || ah == 0x12) {  /* FCB find first (0x11) / find next (0x12) matching file. */
+            const char *fcb = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            if (ah == 0x12) {  /* Find next: no wildcard support, always "no more files". */
+              *(unsigned char*)&regs.rax = 0xff;
+            } else {
+              char dos_path[16];
+              const char *fn;
+              struct stat st;
+              fcb_to_dos_path(fcb, dos_path, dir_state->drive);
+              fn = get_linux_filename(dos_path);
+              if (DEBUG) fprintf(stderr, "debug: fcb_findfirst dos_path=(%s) fn=(%s)\n", dos_path, fn);
+              if (*fn == '\0' || stat(fn, &st) != 0) {
+                *(unsigned char*)&regs.rax = 0xff;  /* Not found. */
+              } else {
+                struct tm *tm;
+                char *dta;
+                char fcb_hdr[12];  /* Save FCB header — DTA may overlap the search FCB (e.g. COMP.COM). */
+                if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 36)) goto error_invalid_parameter;
+                memcpy(fcb_hdr, fcb, 12);
+                dta = (char*)mem + dta_linear;
+                memset(dta, 0, 37);
+                dta[0] = fcb_hdr[0] ? fcb_hdr[0] : (dir_state->drive - 'A' + 1);  /* Drive number (1-based). */
+                memcpy(dta + 1, fcb_hdr + 1, 11);  /* Filename.ext from search template. */
+                /* Bytes 12-13: current block = 0, bytes 14-15: record size = 0 (set by OPEN). */
+                tm = localtime(&st.st_mtime);
+                *(unsigned*)(dta + 16) = (unsigned)((sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
+                    0xffffffffU : st.st_size + (size_t)0);  /* File size (capped at 4GB). */
+                *(unsigned short*)(dta + 20) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 80) << 9;  /* Date. */
+                *(unsigned short*)(dta + 22) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;  /* Time. */
+                *(unsigned char*)&regs.rax = 0;  /* Found. */
+              }
+            }
+          } else if (ah == 0x0f) {  /* FCB open file. */
+            char *fcb = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            char dos_path[16];
+            const char *fn;
+            struct stat st;
+            int fd;
+            fcb_to_dos_path(fcb, dos_path, dir_state->drive);
+            fn = get_linux_filename(dos_path);
+            if (DEBUG) fprintf(stderr, "debug: fcb_open dos_path=(%s) fn=(%s)\n", dos_path, fn);
+            if (*fn == '\0' || (fd = open(fn, O_RDWR)) < 0) {
+              if (*fn != '\0' && errno == EACCES) fd = open(fn, O_RDONLY);  /* Try read-only. */
+              if (fd < 0) {
+                *(unsigned char*)&regs.rax = 0xff;  /* File not found / open error. */
+                goto after_fcb_open;
+              }
+            }
+            if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);
+            if (fstat(fd, &st) != 0) { close(fd); *(unsigned char*)&regs.rax = 0xff; goto after_fcb_open; }
+            { struct tm *tm = localtime(&st.st_mtime);
+              /* Set FCB fields. */
+              *(unsigned short*)(fcb + 0x0c) = 0;  /* Current block = 0. */
+              *(unsigned short*)(fcb + 0x0e) = 128;  /* Record size = 128 (DOS default). */
+              *(unsigned*)(fcb + 0x10) = (unsigned)((sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
+                  0xffffffffU : st.st_size + (size_t)0);
+              *(unsigned short*)(fcb + 0x14) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 80) << 9;  /* Date. */
+              *(unsigned short*)(fcb + 0x16) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;  /* Time. */
+              /* Store Linux fd and magic in reserved area for later use by read/close. */
+              *(unsigned short*)(fcb + 0x18) = (unsigned short)fd;
+              *(unsigned short*)(fcb + 0x1a) = FCB_KV_MAGIC;
+              fcb[0x20] = 0;  /* Current record = 0. */
+              *(unsigned*)(fcb + 0x21) = 0;  /* Random record number = 0. */
+            }
+            *(unsigned char*)&regs.rax = 0;  /* Success. */
+           after_fcb_open:;
+          } else if (ah == 0x10) {  /* FCB close file. */
+            char *fcb = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            if (*(unsigned short*)(fcb + 0x1a) == FCB_KV_MAGIC) {
+              int fd = *(unsigned short*)(fcb + 0x18);
+              if (DEBUG) fprintf(stderr, "debug: fcb_close fd=%d\n", fd);
+              if (fd >= 5) close(fd);
+              *(unsigned short*)(fcb + 0x18) = 0;
+              *(unsigned short*)(fcb + 0x1a) = 0;
+            }
+            *(unsigned char*)&regs.rax = 0;  /* Always succeed. */
+          } else if (ah == 0x27) {  /* FCB random block read. */
+            char *fcb = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            unsigned short rec_size = *(unsigned short*)(fcb + 0x0e);
+            unsigned rec_count = *(unsigned short*)&regs.rcx;
+            unsigned rand_rec = *(unsigned*)(fcb + 0x21);
+            unsigned total_bytes, bytes_read;
+            off_t offset;
+            int fd;
+            if (*(unsigned short*)(fcb + 0x1a) != FCB_KV_MAGIC) {
+              *(unsigned char*)&regs.rax = 0xff;  /* FCB not opened by us. */
+              *(unsigned short*)&regs.rcx = 0;
+              goto after_fcb_rndblkrd;
+            }
+            fd = *(unsigned short*)(fcb + 0x18);
+            if (rec_size == 0) { *(unsigned char*)&regs.rax = 0; *(unsigned short*)&regs.rcx = 0; goto after_fcb_rndblkrd; }
+            total_bytes = rec_count * rec_size;
+            if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + total_bytes - 1)) goto error_invalid_parameter;
+            offset = (off_t)rand_rec * rec_size;
+            if (DEBUG) fprintf(stderr, "debug: fcb_rndblkrd fd=%d rec_size=%u rec_count=%u offset=%ld\n", fd, rec_size, rec_count, (long)offset);
+            if (lseek(fd, offset, SEEK_SET) < 0) {
+              *(unsigned char*)&regs.rax = 1;  /* EOF. */
+              *(unsigned short*)&regs.rcx = 0;
+              goto after_fcb_rndblkrd;
+            }
+            { char *dta = (char*)mem + dta_linear;
+              int got = read(fd, dta, total_bytes);
+              if (got < 0) got = 0;
+              bytes_read = (unsigned)got;
+            }
+            { unsigned recs_read = rec_size > 0 ? bytes_read / rec_size : 0;
+              unsigned remainder = bytes_read % rec_size;
+              /* Update random record number and current block/record. */
+              rand_rec += recs_read + (remainder > 0 ? 1 : 0);
+              *(unsigned*)(fcb + 0x21) = rand_rec;
+              *(unsigned short*)(fcb + 0x0c) = (unsigned short)(rand_rec / 128);  /* Current block. */
+              fcb[0x20] = (char)(rand_rec % 128);  /* Current record. */
+              if (bytes_read == total_bytes) {
+                *(unsigned char*)&regs.rax = 0;  /* All records read. */
+                *(unsigned short*)&regs.rcx = (unsigned short)rec_count;
+              } else if (remainder > 0) {
+                /* Partial record: zero-pad the rest of the last record in DTA. */
+                memset((char*)mem + dta_linear + bytes_read, 0, rec_size - remainder);
+                *(unsigned char*)&regs.rax = 3;  /* Partial record at EOF. */
+                *(unsigned short*)&regs.rcx = (unsigned short)(recs_read + 1);
+              } else {
+                *(unsigned char*)&regs.rax = 1;  /* EOF, no partial record. */
+                *(unsigned short*)&regs.rcx = (unsigned short)recs_read;
+              }
+            }
+           after_fcb_rndblkrd:;
           } else if (ah == 0x29) {  /* Parse filename for FCB. */
             const unsigned char al29 = (unsigned char)regs.rax;
             const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);
@@ -3490,6 +3695,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               /* Uppercase (02), filename uppercase (04), filename chars (05),
                * collating sequence (06), DBCS (07): return identity table at 0x0420. */
               *(unsigned short*)(buf + 1) = 0x0420;  *(unsigned short*)(buf + 3) = 0x0000;
+            } else if (al == 0x23) {  /* Determine if character represents yes/no response. */
+              /* DL = character to test. Returns AX: 0=Yes, 1=No, 2=neither. */
+              const unsigned char dl = (unsigned char)regs.rdx;
+              *(unsigned short*)&regs.rax = (dl == 'Y' || dl == 'y') ? 0 : (dl == 'N' || dl == 'n') ? 1 : 2;
             } else {
               goto fatal_int;
             }
