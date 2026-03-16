@@ -2175,6 +2175,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
   char ctrl_break_checking;  /* 0 or 1. Just a flag, doesn't have any use case. */
+  unsigned short current_psp_para;  /* Current PSP segment, settable via INT 21h/50h. */
   unsigned dta_seg_ofs;  /* Disk transfer address (DTA). */
   unsigned ongoing_set_int;
   unsigned short last_dos_error_code;
@@ -2348,6 +2349,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   tick_count = 0;
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
+  current_psp_para = PSP_PARA;
   dir_state->linux_prog = prog_filename;
   dta_seg_ofs = 0x80 | PSP_PARA << 16;
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
@@ -2821,6 +2823,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             int fd = rename(get_linux_filename(p_old), get_linux_filename_r(p_new, dir_state, fnbuf2, NULL));
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x26) {  /* Create new PSP (legacy DOS 1.0 call). */
+            /* DEBUG.COM uses this to set up a child PSP for the program being debugged. */
+            const unsigned short new_seg = *(unsigned short*)&regs.rdx;
+            char *src = (char*)mem + (PSP_PARA << 4);
+            char *dst = (char*)mem + ((unsigned)new_seg << 4);
+            if (DEBUG) fprintf(stderr, "debug: create PSP at segment 0x%04x\n", new_seg);
+            memcpy(dst, src, 0x100);  /* Copy current PSP to new location. */
           } else if (ah == 0x25) {  /* Set interrupt vector. */
             if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_ints)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
@@ -2837,6 +2846,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 get_int_num == 0x18 ||  /* TASM 3.2, used for memory allocation. */
                 get_int_num == 0x06 ||  /* TLINK 4.0. */
                 get_int_num == 0x67 ||  /* WLINK 7.0. */
+                get_int_num == 0x03 ||  /* DEBUG.COM saves/restores INT 03 (breakpoint). */
+                get_int_num == 0x01 ||  /* DEBUG.COM saves/restores INT 01 (single-step). */
+                get_int_num == 0x02 ||  /* DEBUG.COM saves/restores INT 02 (NMI). */
                 ((had_get_ints & 0x10) && (get_int_num - 0x34 + 0U <= 0x3d - 0x34 + 0U || get_int_num == 0x02 || get_int_num == 0x1b)) ||  /* JWasm 2.11a jwasmr.exe */
                 ((had_get_ints & 2) && (get_int_num == 0x1b || get_int_num == 0x3f)) ||  /* Borland Turbo C++ 1.01 compiler tcc.exe, Borland C++ 2.0 complier bcc.exe */
                0) {
@@ -2908,6 +2920,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 #endif
               *(unsigned short*)&regs.rax = 0xff;  /* Input is ready (0xff). */
 #endif
+            } else if (al == 0x0c) {  /* Generic I/O control for character devices. */
+              /* MORE.COM uses this to set console mode. Stub as no-op. */
+              if (DEBUG) fprintf(stderr, "debug: ioctl generic_char_io dos_fd=%d\n", *(unsigned short*)&regs.rbx);
             } else {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: call=0x%02x dos_fd=%d\n", al, *(unsigned short*)&regs.rbx);
               goto fatal;
@@ -3166,10 +3181,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               struct stat st;
               if (stat(fn, &st) != 0) goto error_from_linux;
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
-              *(unsigned short*)&regs.rax = (st.st_mode & 0200) ? 0 : 1;  /* Indicate DOS read-only flag if owner doesn't have write permissions on Linux. */
+              *(unsigned short*)&regs.rcx = (st.st_mode & 0200) ? 0x20 : 0x21;  /* Archive + read-only if owner lacks write. Return in CX per INT 21h/43h spec. */
             } else {  /* Set. */
-              fprintf(stderr, "fatal: unimplemented: set file attributes: attr=0x%04x filename=%s\n", *(unsigned short*)&regs.rcx, fn);
-              goto fatal;
+              struct stat st;
+              const unsigned short dos_attr = *(unsigned short*)&regs.rcx;
+              if (stat(fn, &st) != 0) goto error_from_linux;
+              if (dos_attr & 1) {  /* DOS read-only: remove owner write. */
+                if (chmod(fn, st.st_mode & ~(mode_t)0200) != 0) goto error_from_linux;
+              } else {  /* Not read-only: add owner write. */
+                if (chmod(fn, st.st_mode | (mode_t)0200) != 0) goto error_from_linux;
+              }
+              /* Other DOS attributes (hidden, system, archive) are silently ignored — no Linux equivalent. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             }
           } else if (ah == 0x33) {  /* Get/set system values. */
             const unsigned char al = (unsigned char)regs.rax;
@@ -3293,8 +3316,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               fprintf(stderr, "fatal: unsupported subcall for switch character: 0x%02x\n", al);
               goto fatal;
             }
+          } else if (ah == 0x50) {  /* Set PSP address. */
+            current_psp_para = *(unsigned short*)&regs.rbx;
+            if (DEBUG) fprintf(stderr, "debug: set PSP to 0x%04x\n", current_psp_para);
           } else if (ah == 0x51 || ah == 0x62) {  /* Get process ID (PSP) (0x51). Get PSP (0x62). */
-            *(unsigned short*)&regs.rbx = PSP_PARA;
+            *(unsigned short*)&regs.rbx = current_psp_para;
           } else if (ah == 0x59) {  /* Get extended error information. */
             *(unsigned short*)&regs.rax = last_dos_error_code;
             if (last_dos_error_code == 0)  {  /* No error. */
