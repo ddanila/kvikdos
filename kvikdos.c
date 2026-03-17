@@ -4202,6 +4202,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else {
             goto fatal_uic;
           }
+        } else if (int_num == 0x0d) {  /* #GP in real mode, or INT 0Dh (BIOS disk reset). */
+          /* On KVM, real-mode code can trigger #GP (vector 13) for benign reasons
+           * such as accessing memory near segment boundaries.  The software CPU
+           * does not enforce these checks, so the same code works without this
+           * handler.  Silently ignore and IRET. */
         } else if (int_num == 0x00) {  /* Division by zero. */
           /* This is called only if the program doesn't override the interrupt vector.
            * Example instructions: `xor ax, ax', `div ax'.
