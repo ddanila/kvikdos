@@ -25,6 +25,7 @@
  */
 
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>  /* For stdin availability check. */
@@ -36,6 +37,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -340,7 +342,7 @@ static char *get_linux_filename_r(const char *p, const DirState *dir_state, char
         for (; *p == '\\' || *p == '/'; ++p) {}
       }
     }
-    if (p[-1] == '/' || p[-1] == '\\') goto error;  /* If pathname ends with a slash, that's an error. It's safe to check since we've checked already that it's not empty. */
+    /* Don't reject trailing slash — it's valid for directory paths (e.g. C:\, SUBDIR\). */
   }
  done:
   *out_p = '\0';
@@ -1020,6 +1022,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
 #define is_linear_byte_user_writable(linear) ((linear) - (ENV_PARA << 4) < (DOS_MEM_LIMIT - (ENV_PARA << 4)))
 
 #define FINDFIRST_MAGIC 0xd5ba1ad0U
+#define FINDFIRST_WILDCARD_MAGIC 0xd5ba1ad1U  /* Wildcard FindFirst; uses slot table. */
 #define FCB_KV_MAGIC 0x4B56U  /* Magic value stored in FCB reserved area to identify kvikdos-opened FCBs. */
 
 /* Convert FCB (drive + 8.3 name) to a DOS path like "C:FILENAME.EXT".
@@ -1837,6 +1840,108 @@ static char is_dos_filename_83(const char *fn) {
   return 1;
 }
 
+/* ── Wildcard FindFirst/FindNext support ───────────────────────────────────
+ *
+ * DOS programs call INT 21h/4Eh (FindFirst) with patterns like "C:\DIR\*.*"
+ * to enumerate a directory.  The slot table below keeps one open DIR* per
+ * active search; the slot index and a unique ID are stored in the DTA
+ * reserved bytes so FindNext (INT 21h/4Fh) can resume from where it left off.
+ */
+
+#define WILDCARD_SEARCH_SLOTS 4
+
+typedef struct {
+  DIR *dir;              /* NULL = slot is free */
+  char pattern[14];      /* uppercase DOS 8.3 wildcard basename */
+  unsigned short attrs;  /* attribute mask from the original FindFirst call */
+  char dir_linux[LINUX_PATH_SIZE]; /* Linux directory path, trailing '/' */
+  unsigned id;           /* unique serial to detect stale DTA references */
+} WildcardSearch;
+
+static WildcardSearch wildcard_searches[WILDCARD_SEARCH_SLOTS];
+static unsigned wildcard_search_next_id = 1;  /* 0 is reserved as "invalid" */
+
+/* Match wildcard component pat against string str (neither contains '.').
+ * Both must be uppercase.  '*' matches any sequence, '?' any single char. */
+static char wc_part_match(const char *pat, const char *str) {
+  for (;;) {
+    if (*pat == '*') {
+      while (*pat == '*') ++pat;
+      if (*pat == '\0') return 1;
+      for (; *str; ++str)
+        if (wc_part_match(pat, str)) return 1;
+      return wc_part_match(pat, str);
+    }
+    if (*pat == '\0') return *str == '\0';
+    if (*pat == '?') {
+      if (*str == '\0') { ++pat; continue; }  /* ? matches zero chars at end of string (DOS 8.3 semantics). */
+    } else {
+      if (*pat != *str) return 0;
+    }
+    ++pat; ++str;
+  }
+}
+
+/* DOS 8.3 wildcard match.  Both pat and name must be uppercase.
+ * Splits on '.' so that "*.*" matches files without a dot/extension. */
+static char dos_wcmatch(const char *pat, const char *name) {
+  const char *pdot = strchr(pat, '.');
+  const char *ndot = strchr(name, '.');
+  if (!pdot) return wc_part_match(pat, name);
+  { char pb[9], pe[4], nb[9], ne[4]; unsigned n;
+    n = (unsigned)(pdot - pat); if (n > 8) n = 8;
+    memcpy(pb, pat, n); pb[n] = '\0';
+    strncpy(pe, pdot + 1, 3); pe[3] = '\0';
+    if (ndot) {
+      n = (unsigned)(ndot - name); if (n > 8) n = 8;
+      memcpy(nb, name, n); nb[n] = '\0';
+      strncpy(ne, ndot + 1, 3); ne[3] = '\0';
+    } else {
+      strncpy(nb, name, 8); nb[8] = '\0';
+      ne[0] = '\0';
+    }
+    return wc_part_match(pb, nb) && wc_part_match(pe, ne);
+  }
+}
+
+/* Read the next directory entry matching ws->pattern/attrs.
+ * Fills DTA bytes 0x15..0x2a on success.  Returns 1 on match, 0 exhausted. */
+static int wildcard_findnext(char *dta, WildcardSearch *ws) {
+  struct dirent *ent;
+  while ((ent = readdir(ws->dir)) != NULL) {
+    char uname[14]; unsigned i;
+    struct stat st; struct tm *tm;
+    char fullpath[LINUX_PATH_SIZE];
+    /* Skip . and .. */
+    if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0' ||
+        (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) continue;
+    /* Uppercase for wildcard matching */
+    for (i = 0; i < 13 && ent->d_name[i]; i++) {
+      char c = ent->d_name[i];
+      uname[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    uname[i] = '\0';
+    if (!dos_wcmatch(ws->pattern, uname)) continue;
+    if (strlen(ws->dir_linux) + strlen(ent->d_name) >= LINUX_PATH_SIZE) continue;
+    strcpy(fullpath, ws->dir_linux); strcat(fullpath, ent->d_name);
+    if (stat(fullpath, &st) != 0) continue;
+    if (S_ISDIR(st.st_mode) && !(ws->attrs & 0x10)) continue;
+    dta[0x15] = S_ISDIR(st.st_mode) ? 0x10 : 0x20;
+    tm = localtime(&st.st_mtime);
+    *(unsigned short*)(dta + 0x16) = (unsigned short)(
+        tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11);
+    *(unsigned short*)(dta + 0x18) = (unsigned short)(
+        tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9);
+    *(unsigned*)(dta + 0x1a) =
+        (sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4)))
+        ? 0xffffffffU : st.st_size + (size_t)0;
+    { char *q = dta + 0x1e; const char *p = uname; char c;
+      do { c = *p++; *q++ = c; } while (c); }
+    return 1;
+  }
+  return 0;
+}
+
 /* scancodes[i] is the US English keyboard scancode corresponding to ASCII
  * code i.
  *
@@ -2540,7 +2645,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 if (last_dos_error_code > 0x12) *(unsigned short*)&regs.rax = 0x0d;  /* Invalid data. Use int 0x21 call with ah == 0x59 to get the real error. */
               }
               *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
-              if (DEBUG) fprintf(stderr, "debug: int 0x21 call error\n");
+              if (DEBUG) fprintf(stderr, "debug: int 0x21 call error ah=0x%02x err=%d\n", ah, last_dos_error_code);
             } else {
               const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
               const int size = (int)*(unsigned short*)&regs.rcx;
@@ -2616,20 +2721,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (ah == 0x47) {  /* Get current directory. */
             char *p, *p0, *pend;
             const char *s;
-            /* Input: DL: 0 = current drive, 1: A: */
-            if (*(unsigned char*)&regs.rdx != 0) { error_invalid_drive:
+            /* Input: DL: 0 = current drive, 1 = A:, 2 = B:, 3 = C:, etc. */
+            const unsigned char dl47 = *(unsigned char*)&regs.rdx;
+            const char drive_idx47 = dl47 == 0 ? dir_state->drive - 'A' : dl47 - 1;
+            if ((unsigned char)drive_idx47 >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drive_idx47]) { error_invalid_drive:
               *(unsigned short*)&regs.rax = 0xf;  /* Invalid drive specified. */
               goto error_on_21;
             }
             p0 = p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + *(unsigned short*)&regs.rsi;
             pend = p + 63;
-            s = dir_state->current_dir[dir_state->drive - 'A'];
+            s = dir_state->current_dir[(int)drive_idx47];
             for (; *s != '\0' && p != pend; ++s, ++p) {
               *p = *s;
             }
             if (p != p0 && p[-1] == '/') --p;  /* Remove trailing '/'. */
             *p = '\0';  /* Silently truncate to 64 bytes. */
-            if (DEBUG) fprintf(stderr, "debug: get current directory on drive %c: (%s)\n", dir_state->drive, p0);
+            if (DEBUG) fprintf(stderr, "debug: get current directory on drive %c: (%s)\n", 'A' + drive_idx47, p0);
             *(unsigned short*)&regs.rax = 0x100;  /* DOSBox 0.74-4 also does this. */
           } else if (ah == 0x3d || ah == 0x3c || ah == 0x5b) {  /* Open to handle. Create to handle. Create new (fail if exists). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
@@ -2740,7 +2847,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rcx = cx_result;
           } else if (ah == 0x57) {  /* Get/set file date and time using handle. */
             const unsigned char al = (unsigned char)regs.rax;
-            if (al < 2) {
+            if (al == 2 || al == 3 || al == 4) {
+              /* Extended attributes (get/set/get-length). Stub: report 0 EAs. */
+              *(unsigned short*)&regs.rcx = 0;  /* CX = 0 (no extended attributes). */
+            } else if (al < 2) {
               const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;
               if (al == 0) {  /* Get. */
@@ -2751,10 +2861,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 *(unsigned short*)&regs.rcx = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
                 *(unsigned short*)&regs.rdx = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
                 tasm30_bitset |= 0x80;
-              } else {  /* Set if al == 1. */
-                /* !! Implement this with utime(2). */
-                fprintf(stderr, "fatal: unimplemented: set file date and time: fd=%d cx:%04x dx:%04x\n", fd, *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx);
-                goto fatal;
+              } else {  /* al == 1: Set file date and time. */
+                const unsigned short cx = *(unsigned short*)&regs.rcx;
+                const unsigned short dx = *(unsigned short*)&regs.rdx;
+                struct tm tm2;
+                struct timeval tv[2];
+                memset(&tm2, 0, sizeof(tm2));
+                tm2.tm_sec  = (cx & 0x1f) << 1;
+                tm2.tm_min  = (cx >> 5) & 0x3f;
+                tm2.tm_hour = (cx >> 11) & 0x1f;
+                tm2.tm_mday = dx & 0x1f;
+                tm2.tm_mon  = ((dx >> 5) & 0x0f) - 1;
+                tm2.tm_year = ((dx >> 9) & 0x7f) + 1980 - 1900;
+                tm2.tm_isdst = -1;
+                tv[0].tv_sec = tv[1].tv_sec = mktime(&tm2);
+                tv[0].tv_usec = tv[1].tv_usec = 0;
+                if (futimes(fd, tv) != 0) goto error_from_linux;
               }
             } else { error_invalid_parameter:
               *(unsigned short*)&regs.rax = 0x57;  /* Invalid parameter. */
@@ -3322,10 +3444,79 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 0x12;  /* No more files. */
               goto error_on_21;
             }
-            if (strchr(pattern, '*') || strchr(pattern, '?')) {  /* TODO(pts): What happens if there are wildcards in earlier pathname components? */
-              fprintf(stderr, "fatal: unsupported wildcards in findfirst pattern: %s\n", pattern);
-              goto fatal;
-            }
+            if (strchr(pattern, '*') || strchr(pattern, '?')) {
+              /* Wildcard search: find the last path separator to split dir / basename. */
+              const char *sep = pattern, *p2;
+              char dir_dos[DOS_PATH_SIZE];
+              char dir_linux[LINUX_PATH_SIZE];
+              char upat[14];
+              unsigned i, slot;
+              WildcardSearch *ws;
+              DIR *dirp;
+              char *dta;
+              for (p2 = pattern; *p2; ++p2)
+                if (*p2 == '\\' || *p2 == '/') sep = p2;
+              /* sep points to last separator (or pattern start if none found) */
+              { const char *basename_pat = (sep == pattern && *sep != '\\' && *sep != '/') ? pattern : sep + 1;
+                unsigned dlen;
+                /* Wildcards must only be in the basename, not the directory */
+                if (sep != pattern && (strchr(pattern, '*') != strchr(basename_pat, '*') ||
+                                       strchr(pattern, '?') != strchr(basename_pat, '?'))) {
+                  fprintf(stderr, "fatal: unsupported wildcards in findfirst directory: %s\n", pattern);
+                  goto fatal;
+                }
+                /* Copy directory portion (everything up to, not including, last sep) */
+                dlen = (sep == pattern && *sep != '\\' && *sep != '/') ? 0 : (unsigned)(sep - pattern);
+                if (dlen >= DOS_PATH_SIZE) { goto no_more_files; }
+                memcpy(dir_dos, pattern, dlen); dir_dos[dlen] = '\0';
+                /* Uppercase the wildcard basename */
+                for (i = 0; i < 13 && basename_pat[i]; i++) {
+                  char c = basename_pat[i];
+                  upat[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+                }
+                if (i >= 13) { goto no_more_files; }
+                upat[i] = '\0';
+              }
+              /* Resolve directory to Linux path */
+              { char tmp[LINUX_PATH_SIZE];
+                size_t tlen;
+                get_linux_filename_r(dir_dos[0] ? dir_dos : ".", dir_state, tmp, NULL);
+                if (tmp[0] == '\0') goto no_more_files;
+                tlen = strlen(tmp);
+                if (tlen + 2 >= LINUX_PATH_SIZE) goto no_more_files;
+                memcpy(dir_linux, tmp, tlen);
+                if (dir_linux[tlen - 1] != '/') dir_linux[tlen++] = '/';
+                dir_linux[tlen] = '\0';
+              }
+              if (DEBUG) fprintf(stderr, "debug: findfirst wildcard dir_linux=(%s) pattern=(%s)\n", dir_linux, upat);
+              dirp = opendir(dir_linux);
+              if (!dirp) goto no_more_files;
+              /* Allocate a slot (free or evict slot 0) */
+              slot = WILDCARD_SEARCH_SLOTS;
+              for (i = 0; i < WILDCARD_SEARCH_SLOTS; i++)
+                if (!wildcard_searches[i].dir) { slot = i; break; }
+              if (slot == WILDCARD_SEARCH_SLOTS) {
+                closedir(wildcard_searches[0].dir);
+                wildcard_searches[0].dir = NULL;
+                slot = 0;
+              }
+              ws = &wildcard_searches[slot];
+              ws->dir = dirp;
+              memcpy(ws->pattern, upat, strlen(upat) + 1);
+              ws->attrs = attrs;
+              memcpy(ws->dir_linux, dir_linux, strlen(dir_linux) + 1);
+              ws->id = wildcard_search_next_id++;
+              if (wildcard_search_next_id == 0) wildcard_search_next_id = 1;
+              dta = (char*)mem + dta_linear;
+              memset(dta, '\0', 0x2b);
+              *(unsigned*)(dta + 0) = FINDFIRST_WILDCARD_MAGIC;
+              *(unsigned*)(dta + 4) = (unsigned)slot;
+              *(unsigned*)(dta + 8) = ws->id;
+              if (!wildcard_findnext(dta, ws)) {
+                closedir(ws->dir); ws->dir = NULL;
+                goto no_more_files;
+              }
+            } else {
             if (!is_dos_filename_83(get_dos_basename(pattern))) goto no_more_files;
             fn = get_linux_filename(pattern);
             fnb = get_linux_basename(fn);
@@ -3337,7 +3528,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               struct stat st;
               struct tm *tm;
               if (stat(fn, &st) != 0) {
-                if (errno == ENOENT) goto no_more_files;
+                if (errno == ENOENT) goto no_more_files;  /* File not found — return 0x12 (no more files), same as DOS. */
+                if (errno == ENOTDIR) { *(unsigned short*)&regs.rax = 3; goto error_on_21; }  /* Path not found. */
                 goto error_from_linux;
               }
               if (S_ISDIR(st.st_mode) && !(attrs & 0x10)) goto no_more_files;
@@ -3360,14 +3552,36 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 if (DEBUG) fprintf(stderr, "debug: found linux_file=(%s) dos_file=(%s)\n", fnb, dta + 0x1e);
               }
             }
+            }
             *(unsigned short*)&regs.rax = 0;  /* Undocumented, but necessary and used as a success indicator by the VAL 1995-05-27 linker val.exe. DOSBox also sets it. */
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x4f) {  /* Find next matching file (findnext). */
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
             if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
             { char * const dta = (char*)mem + dta_linear;
-              if (*(unsigned*)dta != FINDFIRST_MAGIC) goto error_invalid_parameter;
-              goto no_more_files;
+              const unsigned magic = *(unsigned*)dta;
+              if (magic == FINDFIRST_WILDCARD_MAGIC) {
+                const unsigned slot = *(unsigned*)(dta + 4);
+                const unsigned id   = *(unsigned*)(dta + 8);
+                if (slot < WILDCARD_SEARCH_SLOTS &&
+                    wildcard_searches[slot].dir &&
+                    wildcard_searches[slot].id == id) {
+                  WildcardSearch * const ws = &wildcard_searches[slot];
+                  if (wildcard_findnext(dta, ws)) {
+                    *(unsigned short*)&regs.rax = 0;
+                    *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+                  } else {
+                    closedir(ws->dir); ws->dir = NULL;
+                    goto no_more_files;
+                  }
+                } else {
+                  goto no_more_files;
+                }
+              } else if (magic == FINDFIRST_MAGIC) {
+                goto no_more_files;
+              } else {
+                goto error_invalid_parameter;
+              }
             }
           } else if (ah == 0x37) {  /* Get/set switch character (for command-line flags). */
             const unsigned char al = (unsigned char)regs.rax;
