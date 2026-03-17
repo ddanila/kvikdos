@@ -38,6 +38,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/xattr.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -3359,19 +3360,38 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             fn = get_linux_filename(p);
             if (al == 0) {  /* Get. */
               struct stat st;
+              unsigned char xattr_val;
+              unsigned short attr;
               if (stat(fn, &st) != 0) goto error_from_linux;
+              attr = (st.st_mode & 0200) ? 0x00 : 0x01;  /* Read-only from Unix perms. */
+#ifdef __APPLE__
+              if (getxattr(fn, "com.msdos.attr", &xattr_val, 1, 0, 0) == 1) {
+#else
+              if (getxattr(fn, "user.msdos.attr", &xattr_val, 1) == 1) {
+#endif
+                attr |= xattr_val & 0x26;  /* Merge hidden(0x02), system(0x04), archive(0x20) from xattr. */
+              } else {
+                attr |= 0x20;  /* Default: archive bit set (matches real DOS behavior for new files). */
+              }
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
-              *(unsigned short*)&regs.rcx = (st.st_mode & 0200) ? 0x20 : 0x21;  /* Archive + read-only if owner lacks write. Return in CX per INT 21h/43h spec. */
+              *(unsigned short*)&regs.rcx = attr;
             } else {  /* Set. */
               struct stat st;
               const unsigned short dos_attr = *(unsigned short*)&regs.rcx;
+              unsigned char xattr_val;
               if (stat(fn, &st) != 0) goto error_from_linux;
               if (dos_attr & 1) {  /* DOS read-only: remove owner write. */
                 if (chmod(fn, st.st_mode & ~(mode_t)0200) != 0) goto error_from_linux;
               } else {  /* Not read-only: add owner write. */
                 if (chmod(fn, st.st_mode | (mode_t)0200) != 0) goto error_from_linux;
               }
-              /* Other DOS attributes (hidden, system, archive) are silently ignored — no Linux equivalent. */
+              /* Persist hidden, system, archive bits in xattr (no Unix equivalent). */
+              xattr_val = (unsigned char)(dos_attr & 0x26);
+#ifdef __APPLE__
+              setxattr(fn, "com.msdos.attr", &xattr_val, 1, 0, 0);
+#else
+              setxattr(fn, "user.msdos.attr", &xattr_val, 1, 0);
+#endif
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             }
           } else if (ah == 0x33) {  /* Get/set system values. */
