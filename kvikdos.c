@@ -37,6 +37,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -341,7 +342,7 @@ static char *get_linux_filename_r(const char *p, const DirState *dir_state, char
         for (; *p == '\\' || *p == '/'; ++p) {}
       }
     }
-    if (p[-1] == '/' || p[-1] == '\\') goto error;  /* If pathname ends with a slash, that's an error. It's safe to check since we've checked already that it's not empty. */
+    /* Don't reject trailing slash — it's valid for directory paths (e.g. C:\, SUBDIR\). */
   }
  done:
   *out_p = '\0';
@@ -1871,7 +1872,7 @@ static char wc_part_match(const char *pat, const char *str) {
     }
     if (*pat == '\0') return *str == '\0';
     if (*pat == '?') {
-      if (*str == '\0') return 0;
+      if (*str == '\0') { ++pat; continue; }  /* ? matches zero chars at end of string (DOS 8.3 semantics). */
     } else {
       if (*pat != *str) return 0;
     }
@@ -2639,7 +2640,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 if (last_dos_error_code > 0x12) *(unsigned short*)&regs.rax = 0x0d;  /* Invalid data. Use int 0x21 call with ah == 0x59 to get the real error. */
               }
               *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
-              if (DEBUG) fprintf(stderr, "debug: int 0x21 call error\n");
+              if (DEBUG) fprintf(stderr, "debug: int 0x21 call error ah=0x%02x err=%d\n", ah, last_dos_error_code);
             } else {
               const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
               const int size = (int)*(unsigned short*)&regs.rcx;
@@ -2713,20 +2714,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (ah == 0x47) {  /* Get current directory. */
             char *p, *p0, *pend;
             const char *s;
-            /* Input: DL: 0 = current drive, 1: A: */
-            if (*(unsigned char*)&regs.rdx != 0) { error_invalid_drive:
+            /* Input: DL: 0 = current drive, 1 = A:, 2 = B:, 3 = C:, etc. */
+            const unsigned char dl47 = *(unsigned char*)&regs.rdx;
+            const char drive_idx47 = dl47 == 0 ? dir_state->drive - 'A' : dl47 - 1;
+            if ((unsigned char)drive_idx47 >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drive_idx47]) { error_invalid_drive:
               *(unsigned short*)&regs.rax = 0xf;  /* Invalid drive specified. */
               goto error_on_21;
             }
             p0 = p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + *(unsigned short*)&regs.rsi;
             pend = p + 63;
-            s = dir_state->current_dir[dir_state->drive - 'A'];
+            s = dir_state->current_dir[(int)drive_idx47];
             for (; *s != '\0' && p != pend; ++s, ++p) {
               *p = *s;
             }
             if (p != p0 && p[-1] == '/') --p;  /* Remove trailing '/'. */
             *p = '\0';  /* Silently truncate to 64 bytes. */
-            if (DEBUG) fprintf(stderr, "debug: get current directory on drive %c: (%s)\n", dir_state->drive, p0);
+            if (DEBUG) fprintf(stderr, "debug: get current directory on drive %c: (%s)\n", 'A' + drive_idx47, p0);
             *(unsigned short*)&regs.rax = 0x100;  /* DOSBox 0.74-4 also does this. */
           } else if (ah == 0x3d || ah == 0x3c || ah == 0x5b) {  /* Open to handle. Create to handle. Create new (fail if exists). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
@@ -2837,7 +2840,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rcx = cx_result;
           } else if (ah == 0x57) {  /* Get/set file date and time using handle. */
             const unsigned char al = (unsigned char)regs.rax;
-            if (al < 2 ) {
+            if (al == 2 || al == 3 || al == 4) {
+              /* Extended attributes (get/set/get-length). Stub: report 0 EAs. */
+              *(unsigned short*)&regs.rcx = 0;  /* CX = 0 (no extended attributes). */
+            } else if (al < 2 ) {
               const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;
               if (al == 0) {  /* Get. */
@@ -2847,10 +2853,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 tm = localtime(&st.st_mtime);
                 *(unsigned short*)&regs.rcx = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
                 *(unsigned short*)&regs.rdx = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
-              } else if (al == 0) {  /* Set. */
-                /* !! Implement this with utime(2). */
-                fprintf(stderr, "fatal: unimplemented: set file date and time: fd=%d cx:%04x dx:%04x\n", fd, *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx);
-                goto fatal;
+              } else {  /* al == 1: Set file date and time. */
+                const unsigned short cx = *(unsigned short*)&regs.rcx;
+                const unsigned short dx = *(unsigned short*)&regs.rdx;
+                struct tm tm2;
+                struct timeval tv[2];
+                memset(&tm2, 0, sizeof(tm2));
+                tm2.tm_sec  = (cx & 0x1f) << 1;
+                tm2.tm_min  = (cx >> 5) & 0x3f;
+                tm2.tm_hour = (cx >> 11) & 0x1f;
+                tm2.tm_mday = dx & 0x1f;
+                tm2.tm_mon  = ((dx >> 5) & 0x0f) - 1;
+                tm2.tm_year = ((dx >> 9) & 0x7f) + 1980 - 1900;
+                tm2.tm_isdst = -1;
+                tv[0].tv_sec = tv[1].tv_sec = mktime(&tm2);
+                tv[0].tv_usec = tv[1].tv_usec = 0;
+                if (futimes(fd, tv) != 0) goto error_from_linux;
               }
             } else { error_invalid_parameter:
               *(unsigned short*)&regs.rax = 0x57;  /* Invalid parameter. */
@@ -3502,7 +3520,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               struct stat st;
               struct tm *tm;
               if (stat(fn, &st) != 0) {
-                if (errno == ENOENT) goto no_more_files;
+                if (errno == ENOENT) goto no_more_files;  /* File not found — return 0x12 (no more files), same as DOS. */
+                if (errno == ENOTDIR) { *(unsigned short*)&regs.rax = 3; goto error_on_21; }  /* Path not found. */
                 goto error_from_linux;
               }
               if (S_ISDIR(st.st_mode) && !(attrs & 0x10)) goto no_more_files;
