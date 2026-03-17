@@ -2284,6 +2284,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
   char ctrl_break_checking;  /* 0 or 1. Just a flag, doesn't have any use case. */
+  char verify_flag;  /* 0=off, 1=on. Tracks INT 21h/2Eh state; returned by INT 21h/54h. */
   unsigned short current_psp_para;  /* Current PSP segment, settable via INT 21h/50h. */
   unsigned dta_seg_ofs;  /* Disk transfer address (DTA). */
   unsigned ongoing_set_int;
@@ -2462,6 +2463,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   tick_count = 0;
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
+  verify_flag = 0;
   current_psp_para = PSP_PARA;
   dir_state->linux_prog = prog_filename;
   dta_seg_ofs = 0x80 | PSP_PARA << 16;
@@ -2742,6 +2744,21 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *p = '\0';  /* Silently truncate to 64 bytes. */
             if (DEBUG) fprintf(stderr, "debug: get current directory on drive %c: (%s)\n", 'A' + drive_idx47, p0);
             *(unsigned short*)&regs.rax = 0x100;  /* DOSBox 0.74-4 also does this. */
+          } else if (ah == 0x5a) {  /* Create unique (temporary) file. CX=attrs, DS:DX->dir path ending with '\'. */
+            /* Appends a generated name to the path at DS:DX, creates the file, returns handle in AX. */
+            char * const dir_p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + *(unsigned short*)&regs.rdx;
+            static unsigned tmp_counter = 0;
+            char *end_p;
+            int fd5a;
+            for (end_p = dir_p; *end_p != '\0'; ++end_p) {}
+            /* Generate a unique 8-char name and append to path. */
+            do {
+              sprintf(end_p, "%08X", ++tmp_counter);
+            } while (access(get_linux_filename(dir_p), F_OK) == 0 && tmp_counter < 0x10000);
+            fd5a = open(get_linux_filename(dir_p), O_RDWR | O_CREAT | O_EXCL, 0666);
+            if (fd5a < 0) goto error_from_linux;
+            *(unsigned short*)&regs.rax = fd5a;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x3d || ah == 0x3c || ah == 0x5b) {  /* Open to handle. Create to handle. Create new (fail if exists). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int flags = (ah == 0x3c) ? O_RDWR | O_CREAT | O_TRUNC :
@@ -2993,6 +3010,51 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
             if (DEBUG) fprintf(stderr, "debug: chdir drive %c: -> (%s)\n", 'A' + chdir_drive_idx, dir_state->current_dir[(int)chdir_drive_idx]);
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x13) {  /* Delete file using FCB. Returns AL=0 on success, AL=0xFF on error. */
+            /* FCB layout: byte 0=drive (0=current), bytes 1-8=name, bytes 9-11=ext (space-padded).
+             * Wildcards ('?') in name/ext are possible but not handled here — single-file delete only. */
+            const unsigned char * const fcb13 = (const unsigned char*)mem + ((unsigned)sregs.ds.selector << 4) + *(unsigned short*)&regs.rdx;
+            char dos_del[14];
+            char *p;
+            unsigned i, e;
+            p = dos_del;
+            if (fcb13[0] != 0) { *p++ = (char)('A' + fcb13[0] - 1); *p++ = ':'; }
+            for (i = 1; i <= 8 && fcb13[i] != ' '; i++) *p++ = (char)fcb13[i];
+            e = 3; while (e > 0 && fcb13[9 + e - 1] == ' ') e--;
+            if (e > 0) { *p++ = '.'; memcpy(p, fcb13 + 9, e); p += e; }
+            *p = '\0';
+            if (unlink(get_linux_filename(dos_del)) != 0) {
+              *(unsigned char*)&regs.rax = 0xff;
+            } else {
+              *(unsigned char*)&regs.rax = 0x00;
+            }
+          } else if (ah == 0x17) {  /* Rename file using FCB. Returns AL=0 on success, AL=0xFF on error. */
+            /* FCB layout: byte 0=drive (0=current), bytes 1-8=old name, bytes 9-11=old ext,
+             * bytes 12-16=reserved, byte 17=new drive, bytes 18-25=new name, bytes 26-28=new ext.
+             * All names space-padded, uppercase. Wildcards not supported here. */
+            const unsigned char * const fcb = (const unsigned char*)mem + ((unsigned)sregs.ds.selector << 4) + *(unsigned short*)&regs.rdx;
+            char dos_old[14], dos_new[14];
+            char *p;
+            unsigned i, e;
+            p = dos_old;
+            if (fcb[0] != 0) { *p++ = (char)('A' + fcb[0] - 1); *p++ = ':'; }
+            for (i = 1; i <= 8 && fcb[i] != ' '; i++) *p++ = (char)fcb[i];
+            e = 3; while (e > 0 && fcb[9 + e - 1] == ' ') e--;
+            if (e > 0) { *p++ = '.'; memcpy(p, fcb + 9, e); p += e; }
+            *p = '\0';
+            p = dos_new;
+            /* COMMAND.COM places the second INT 21h/29h result at FCB+0x10, so:
+             * FCB[0x10]=new drive, FCB[0x11-0x18]=new name, FCB[0x19-0x1B]=new ext. */
+            if (fcb[0x10] != 0) { *p++ = (char)('A' + fcb[0x10] - 1); *p++ = ':'; }
+            for (i = 0; i < 8 && fcb[0x11 + i] != ' '; i++) *p++ = (char)fcb[0x11 + i];
+            e = 3; while (e > 0 && fcb[0x19 + e - 1] == ' ') e--;
+            if (e > 0) { *p++ = '.'; memcpy(p, fcb + 0x19, e); p += e; }
+            *p = '\0';
+            if (rename(get_linux_filename(dos_old), get_linux_filename_r(dos_new, dir_state, fnbuf2, NULL)) != 0) {
+              *(unsigned char*)&regs.rax = 0xff;
+            } else {
+              *(unsigned char*)&regs.rax = 0x00;
+            }
           } else if (ah == 0x41) {  /* Delete file. */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int fd = unlink(get_linux_filename(p));
@@ -3424,6 +3486,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               fprintf(stderr, "fatal: unimplemented: get/set system values: al:%04x dl:%04x\n", al, dl);
               goto fatal;
             }
+          } else if (ah == 0x2e) {  /* Set verify flag. AL=0: off, AL=1: on. */
+            verify_flag = (unsigned char)regs.rax != 0;
+          } else if (ah == 0x54) {  /* Get verify state. Returns AL=0 (off) or AL=1 (on). */
+            *(unsigned char*)&regs.rax = verify_flag;
           } else if (ah == 0x0e) {  /* Select disk. */
             /* TODO(pts): Use the default drive specified here (dl + 'A') in get_linux_filename_r(...). */
             const unsigned char dl = (unsigned char)regs.rdx;
@@ -4214,6 +4280,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
              * SET: silently ignore — kvikdos has no message retrieval system. */
             *(unsigned short*)&regs.rdi = 0;
             SET_SREG(es, 0);
+          } else if (ah == 0x19) {  /* COMMAND.COM shell multiplex (DOS 4.0). */
+            /* AX=1902h: mult_shell_get — outer shell supplying next command.
+             * AX=1903h: mult_shell_brk — outer shell requesting ^C termination.
+             * Return AL=0 (not shell_action=0FFh) so COMMAND.COM reads from batch file normally. */
+            *(unsigned char*)&regs.rax = 0;
           } else { fatal_uic:
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal_int;
