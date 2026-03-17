@@ -2355,6 +2355,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     for (i = 0; i < 256; ++i) p[2 + i] = (unsigned char)i;  /* Identity collating map. */
   }
   memcpy((char*)mem + 0x0522, &country_info, sizeof(country_info));
+  /* Empty DBCS lead byte table at 0x053A (right after country_info), for INT 21h/AH=63h.
+   * Format: pairs of start/end bytes, terminated by 0x0000. Zero = no DBCS. */
+  *(unsigned short*)((char*)mem + 0x053a) = 0x0000;
 
   /*memcpy(initial_sregs, &sregs, sizeof(sregs));*/  /* Not completely 0, but sregs.Xs.selector is 0. */
   sregs.fs.selector = sregs.gs.selector = ENV_PARA;  /* Random value after magic interrupt table. */
@@ -3431,8 +3434,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rbx = dta_seg_ofs;
           } else if (ah == 0x1a) {  /* Set disk transfer address (DTA). */
             dta_seg_ofs = *(unsigned short*)&regs.rdx | sregs.ds.selector << 16;
-          } else if (ah == 0x63) {  /* Get lead byte table. Multibyte support in MS-DOS 2.25. */
-            goto nonfatal_unknown_int_21_call;
+          } else if (ah == 0x63) {  /* Get lead byte table (DBCS). Multibyte support in MS-DOS 2.25. */
+            /* AL=00: Get DBCS lead byte table pointer in DS:SI.
+             * SYSLOADMSG calls this in a loop; if we return CF=1 it retries forever.
+             * Return DS:SI pointing to a 0000 terminator (= empty table, no DBCS).
+             * Empty table at 0x053A (after collating table and country info). */
+            SET_SREG(ds, 0x0000);
+            *(unsigned short*)&regs.rsi = 0x053a;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x38) {  /* Get/set country dependent information. */
             const unsigned char al = (unsigned char)regs.rax;
             char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
