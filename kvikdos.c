@@ -3097,7 +3097,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 0xff;  /* Input is ready (0xff). */
 #endif
             } else if (al == 0x0c) {  /* Generic I/O control for character devices. */
-              /* MORE.COM uses this to set console mode. Stub as no-op. */
+              /* CL=0x7F (Get Display) — EDLIN uses this to read screen width;
+               * if we succeed without filling the buffer, it reads 0 and divides by zero.
+               * Return CF=1 so callers fall back to defaults (e.g. 80 columns). */
+              if ((*(unsigned short*)&regs.rcx & 0xff) == 0x7f) { *(unsigned short*)&regs.rax = 1; goto error_on_21; }
+              /* Other sub-functions (e.g. MORE.COM set console mode): no-op success. */
               if (DEBUG) fprintf(stderr, "debug: ioctl generic_char_io dos_fd=%d\n", *(unsigned short*)&regs.rbx);
             } else {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: call=0x%02x dos_fd=%d\n", al, *(unsigned short*)&regs.rbx);
