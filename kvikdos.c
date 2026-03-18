@@ -1927,7 +1927,20 @@ static int wildcard_findnext(char *dta, WildcardSearch *ws) {
     strcpy(fullpath, ws->dir_linux); strcat(fullpath, ent->d_name);
     if (stat(fullpath, &st) != 0) continue;
     if (S_ISDIR(st.st_mode) && !(ws->attrs & 0x10)) continue;
-    dta[0x15] = S_ISDIR(st.st_mode) ? 0x10 : 0x20;
+    { unsigned char attr = S_ISDIR(st.st_mode) ? 0x10 : 0x00;
+      unsigned char xattr_val;
+      if (!(st.st_mode & 0200)) attr |= 0x01;  /* Read-only from Unix perms. */
+#ifdef __APPLE__
+      if (getxattr(fullpath, "com.msdos.attr", &xattr_val, 1, 0, 0) == 1) {
+#else
+      if (getxattr(fullpath, "user.msdos.attr", &xattr_val, 1) == 1) {
+#endif
+        attr |= xattr_val & 0x26;  /* Merge hidden(0x02), system(0x04), archive(0x20) from xattr. */
+      } else if (!S_ISDIR(st.st_mode)) {
+        attr |= 0x20;  /* Default: archive bit set (matches real DOS behavior for new files). */
+      }
+      dta[0x15] = (char)attr;
+    }
     tm = localtime(&st.st_mtime);
     *(unsigned short*)(dta + 0x16) = (unsigned short)(
         tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11);
@@ -3634,6 +3647,20 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (S_ISDIR(st.st_mode) && !(attrs & 0x10)) goto no_more_files;
               dta = (char*)mem + dta_linear;
               memset(dta, '\0', 0x16);
+              { unsigned char attr = S_ISDIR(st.st_mode) ? 0x10 : 0x00;
+                unsigned char xattr_val;
+                if (!(st.st_mode & 0200)) attr |= 0x01;  /* Read-only from Unix perms. */
+#ifdef __APPLE__
+                if (getxattr(fn, "com.msdos.attr", &xattr_val, 1, 0, 0) == 1) {
+#else
+                if (getxattr(fn, "user.msdos.attr", &xattr_val, 1) == 1) {
+#endif
+                  attr |= xattr_val & 0x26;  /* Merge hidden(0x02), system(0x04), archive(0x20) from xattr. */
+                } else if (!S_ISDIR(st.st_mode)) {
+                  attr |= 0x20;  /* Default: archive bit set (matches real DOS behavior for new files). */
+                }
+                dta[0x15] = (char)attr;
+              }
               tm = localtime(&st.st_mtime);
               *(unsigned*)dta = FINDFIRST_MAGIC;  /* Just a random value which findnext can identify. */
               *(unsigned short*)(dta + 0x16) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
