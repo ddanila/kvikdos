@@ -2728,6 +2728,15 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned char*)&regs.rax = tm->tm_wday;
             *(unsigned short*)&regs.rcx = tm->tm_year + 1900;
             *(unsigned short*)&regs.rdx = (tm->tm_mon + 1) << 8 | tm->tm_mday;
+          } else if (ah == 0x2b) {  /* Set date (validation stub). CX=year, DH=month, DL=day. Returns AL=0 valid, AL=FF invalid. */
+            const unsigned short year = *(unsigned short*)&regs.rcx;
+            const unsigned char month = *(((unsigned char*)&regs.rdx) + 1);
+            const unsigned char day = *(unsigned char*)&regs.rdx;
+            if (year >= 1980 && year <= 2099 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+              *(unsigned char*)&regs.rax = 0;  /* Valid. */
+            } else {
+              *(unsigned char*)&regs.rax = 0xff;  /* Invalid. */
+            }
           } else if (ah == 0x19) {  /* Get current drive. */
             *(unsigned char*)&regs.rax = dir_state->drive - 'A';
           } else if (ah == 0x47) {  /* Get current directory. */
