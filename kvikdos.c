@@ -1860,6 +1860,20 @@ typedef struct {
 static WildcardSearch wildcard_searches[WILDCARD_SEARCH_SLOTS];
 static unsigned wildcard_search_next_id = 1;  /* 0 is reserved as "invalid" */
 
+/* Per-drive volume labels (11 bytes each, space-padded, uppercase).
+ * "NO NAME    " is the default.  Set via INT 21h/16h (FCB create with
+ * attr_volume_id), read via INT 21h/11h (FCB findfirst with attr=0x08)
+ * and INT 21h/69h (get disk serial number). */
+static char volume_labels[DRIVE_COUNT][12];  /* 11 chars + NUL sentinel. */
+static char volume_labels_inited;
+
+static void init_volume_labels(void) {
+  int i;
+  if (volume_labels_inited) return;
+  for (i = 0; i < DRIVE_COUNT; i++) memcpy(volume_labels[i], "NO NAME    ", 12);
+  volume_labels_inited = 1;
+}
+
 /* Match wildcard component pat against string str (neither contains '.').
  * Both must be uppercase.  '*' matches any sequence, '?' any single char. */
 static char wc_part_match(const char *pat, const char *str) {
@@ -1953,6 +1967,109 @@ static int wildcard_findnext(char *dta, WildcardSearch *ws) {
   }
   return 0;
 }
+
+/* Convert uppercase DOS 8.3 name (ASCIIZ, e.g. "TEST.TXT") to FCB 8.3
+ * space-padded format.  out must be at least 11 bytes. */
+static void filename_to_fcb83(const char *name, char *out) {
+  const char *dot = strchr(name, '.');
+  int i;
+  memset(out, ' ', 11);
+  if (dot) {
+    int nlen = (int)(dot - name); if (nlen > 8) nlen = 8;
+    for (i = 0; i < nlen; i++) out[i] = name[i];
+    for (i = 0; i < 3 && dot[1 + i]; i++) out[8 + i] = dot[1 + i];
+  } else {
+    int nlen = (int)strlen(name); if (nlen > 8) nlen = 8;
+    for (i = 0; i < nlen; i++) out[i] = name[i];
+  }
+}
+
+/* Convert FCB 8.3 space-padded name (bytes 1-11 of FCB) to a wildcard
+ * pattern suitable for dos_wcmatch().  out must be at least 14 bytes.
+ * '?' chars in the FCB are preserved for wildcard matching. */
+static void fcb_to_pattern(const char *fcb, char *out) {
+  int i; char *p = out;
+  for (i = 1; i <= 8 && fcb[i] != ' '; i++) *p++ = fcb[i];
+  if (fcb[9] != ' ') {
+    *p++ = '.';
+    for (i = 9; i <= 11 && fcb[i] != ' '; i++) *p++ = fcb[i];
+  } else {
+    /* All-space ext: add .* so that dos_wcmatch matches any extension. */
+    *p++ = '.'; *p++ = '*';
+  }
+  *p = '\0';
+}
+
+/* Check if FCB filename (bytes 1-11) contains wildcard '?' characters. */
+static int fcb_has_wildcard(const char *fcb) {
+  int i;
+  for (i = 1; i <= 11; i++) if (fcb[i] == '?') return 1;
+  return 0;
+}
+
+/* Read the next directory entry matching ws->pattern/attrs.
+ * Fills dta_fcb in DOS directory entry format (32 bytes):
+ *   Bytes 0-7:  filename (space-padded), Bytes 8-10: extension (space-padded),
+ *   Byte 11:    attribute, Bytes 12-21: reserved/pad,
+ *   Bytes 22-23: time, Bytes 24-25: date, Bytes 26-27: first cluster (0),
+ *   Bytes 28-29: size low, Bytes 30-31: size high.
+ * The caller prepends drive byte (and extended FCB header if needed).
+ * Sets *attr_out to the file attribute byte.
+ * Returns 1 on match, 0 if exhausted. */
+static int fcb_wildcard_findnext(char *direntry, WildcardSearch *ws, unsigned char *attr_out) {
+  struct dirent *ent;
+  while ((ent = readdir(ws->dir)) != NULL) {
+    char uname[14]; unsigned i;
+    struct stat st; struct tm *tm;
+    char fullpath[LINUX_PATH_SIZE];
+    unsigned char attr;
+    unsigned size32;
+    if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0' ||
+        (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) continue;
+    for (i = 0; i < 13 && ent->d_name[i]; i++) {
+      char c = ent->d_name[i];
+      uname[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    uname[i] = '\0';
+    if (!dos_wcmatch(ws->pattern, uname)) continue;
+    if (strlen(ws->dir_linux) + strlen(ent->d_name) >= LINUX_PATH_SIZE) continue;
+    strcpy(fullpath, ws->dir_linux); strcat(fullpath, ent->d_name);
+    if (stat(fullpath, &st) != 0) continue;
+    attr = S_ISDIR(st.st_mode) ? 0x10 : 0x00;
+    { unsigned char xattr_val;
+      if (!(st.st_mode & 0200)) attr |= 0x01;
+#ifdef __APPLE__
+      if (getxattr(fullpath, "com.msdos.attr", &xattr_val, 1, 0, 0) == 1) {
+#else
+      if (getxattr(fullpath, "user.msdos.attr", &xattr_val, 1) == 1) {
+#endif
+        attr |= xattr_val & 0x26;
+      } else if (!S_ISDIR(st.st_mode)) {
+        attr |= 0x20;
+      }
+    }
+    if (S_ISDIR(st.st_mode) && !(ws->attrs & 0x10)) continue;
+    memset(direntry, 0, 32);
+    filename_to_fcb83(uname, direntry);       /* Bytes 0-10: 8.3 name */
+    direntry[11] = (char)attr;                /* Byte 11: attribute */
+    /* Bytes 12-21: reserved (zeroed) */
+    tm = localtime(&st.st_mtime);
+    *(unsigned short*)(direntry + 22) = (unsigned short)(
+        tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11);  /* dir_time */
+    *(unsigned short*)(direntry + 24) = (unsigned short)(
+        tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 80) << 9);  /* dir_date */
+    /* Bytes 26-27: first cluster = 0 */
+    size32 = (sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4)))
+        ? 0xffffffffU : (unsigned)(st.st_size + (size_t)0);
+    *(unsigned short*)(direntry + 28) = (unsigned short)size32;          /* dir_size_l */
+    *(unsigned short*)(direntry + 30) = (unsigned short)(size32 >> 16);  /* dir_size_h */
+    *attr_out = attr;
+    return 1;
+  }
+  return 0;
+}
+
+#define FCB_SEARCH_MAGIC 0xFCU  /* Magic byte stored in FCB reserved area to identify active wildcard search. */
 
 /* scancodes[i] is the US English keyboard scancode corresponding to ASCII
  * code i.
@@ -3752,36 +3869,178 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             (*(unsigned short*)&regs.rbx) = 0x80;
             SET_SREG(es, 0xfff0);
           } else if (ah == 0x11 || ah == 0x12) {  /* FCB find first (0x11) / find next (0x12) matching file. */
-            const char *fcb = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            char *fcb = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
-            if (ah == 0x12) {  /* Find next: no wildcard support, always "no more files". */
-              *(unsigned char*)&regs.rax = 0xff;
-            } else {
-              char dos_path[16];
-              const char *fn;
-              struct stat st;
-              fcb_to_dos_path(fcb, dos_path, dir_state->drive);
-              fn = get_linux_filename(dos_path);
-              if (DEBUG) fprintf(stderr, "debug: fcb_findfirst dos_path=(%s) fn=(%s)\n", dos_path, fn);
-              if (*fn == '\0' || stat(fn, &st) != 0) {
-                *(unsigned char*)&regs.rax = 0xff;  /* Not found. */
+            /* Detect extended FCB: first byte == 0xFF, attribute at byte 6, regular FCB starts at byte 7. */
+            const int is_ext_fcb = ((unsigned char)fcb[0] == 0xff);
+            const char *reg_fcb = fcb + (is_ext_fcb ? 7 : 0);  /* Points to drive byte of regular FCB. */
+            const unsigned char search_attr = is_ext_fcb ? (unsigned char)fcb[6] : 0;
+            /* DTA layout: [ext_header(7)] + drive(1) + dir_entry(32).
+             * For extended FCB: 7+1+32 = 40.  For regular: 1+32 = 33. */
+            const unsigned dta_size = is_ext_fcb ? 40 : 33;
+            const unsigned dta_drv_off = is_ext_fcb ? 7 : 0;   /* Offset to drive byte in DTA. */
+            const unsigned dta_entry_off = is_ext_fcb ? 8 : 1;  /* Offset to dir_entry (8.3 name) in DTA. */
+            const unsigned char drv_num = reg_fcb[0] ? reg_fcb[0] : (unsigned char)(dir_state->drive - 'A' + 1);
+            if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + dta_size - 1)) goto error_invalid_parameter;
+            if (ah == 0x12) {  /* Find next. */
+              /* Check for active wildcard search in FCB reserved bytes. */
+              if ((unsigned char)reg_fcb[0x18] == FCB_SEARCH_MAGIC) {
+                const unsigned slot = (unsigned char)reg_fcb[0x19];
+                const unsigned id = *(unsigned short*)(reg_fcb + 0x1a);
+                if (slot < WILDCARD_SEARCH_SLOTS &&
+                    wildcard_searches[slot].dir &&
+                    wildcard_searches[slot].id == id) {
+                  WildcardSearch *ws = &wildcard_searches[slot];
+                  unsigned char attr;
+                  char *dta = (char*)mem + dta_linear;
+                  if (fcb_wildcard_findnext(dta + dta_entry_off, ws, &attr)) {
+                    dta[dta_drv_off] = (char)drv_num;
+                    if (is_ext_fcb) {
+                      dta[0] = (char)0xff;
+                      memset(dta + 1, 0, 5);
+                      dta[6] = (char)attr;
+                    }
+                    *(unsigned char*)&regs.rax = 0;
+                  } else {
+                    closedir(ws->dir); ws->dir = NULL;
+                    *(unsigned char*)&regs.rax = 0xff;
+                  }
+                } else {
+                  *(unsigned char*)&regs.rax = 0xff;
+                }
               } else {
-                struct tm *tm;
+                *(unsigned char*)&regs.rax = 0xff;  /* No active search or non-wildcard — no more files. */
+              }
+            } else {  /* Find first (0x11). */
+              if (search_attr == 0x08) {
+                /* Volume label search: return the in-memory volume label. */
+                char *dta = (char*)mem + dta_linear;
+                int drv_idx = (int)(drv_num - 1);
+                init_volume_labels();
+                if ((unsigned)drv_idx >= DRIVE_COUNT || memcmp(volume_labels[drv_idx], "NO NAME    ", 11) == 0) {
+                  *(unsigned char*)&regs.rax = 0xff;  /* No label set — return not found. */
+                } else {
+                  memset(dta, 0, dta_size);
+                  if (is_ext_fcb) {
+                    dta[0] = (char)0xff;
+                    dta[6] = 0x08;  /* attr = volume label */
+                  }
+                  dta[dta_drv_off] = (char)drv_num;
+                  memcpy(dta + dta_entry_off, volume_labels[drv_idx], 11);  /* 8.3 name = label */
+                  dta[dta_entry_off + 11] = 0x08;  /* dir_attr = volume label */
+                  *(unsigned char*)&regs.rax = 0;
+                }
+              } else if (fcb_has_wildcard(reg_fcb)) {
+                /* Wildcard FCB search: enumerate directory. */
+                char pattern[14], drive_str[3];
+                char dir_linux[LINUX_PATH_SIZE];
+                unsigned i, slot;
+                WildcardSearch *ws;
+                DIR *dirp;
                 char *dta;
-                char fcb_hdr[12];  /* Save FCB header — DTA may overlap the search FCB (e.g. COMP.COM). */
-                if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 36)) goto error_invalid_parameter;
-                memcpy(fcb_hdr, fcb, 12);
+                unsigned char attr;
+                size_t tlen;
+                fcb_to_pattern(reg_fcb, pattern);
+                if (DEBUG) fprintf(stderr, "debug: fcb_findfirst wildcard pattern=(%s) attr=0x%02x ext=%d\n", pattern, search_attr, is_ext_fcb);
+                /* Resolve current directory on the search drive to Linux path. */
+                drive_str[0] = 'A' + drv_num - 1;
+                drive_str[1] = ':';
+                drive_str[2] = '\0';
+                get_linux_filename_r(drive_str, dir_state, dir_linux, NULL);
+                if (dir_linux[0] == '\0') { *(unsigned char*)&regs.rax = 0xff; goto after_fcb_find; }
+                tlen = strlen(dir_linux);
+                if (tlen + 2 >= LINUX_PATH_SIZE) { *(unsigned char*)&regs.rax = 0xff; goto after_fcb_find; }
+                if (dir_linux[tlen - 1] != '/') dir_linux[tlen++] = '/';
+                dir_linux[tlen] = '\0';
+                dirp = opendir(dir_linux);
+                if (!dirp) { *(unsigned char*)&regs.rax = 0xff; goto after_fcb_find; }
+                /* Allocate a WildcardSearch slot. */
+                slot = WILDCARD_SEARCH_SLOTS;
+                for (i = 0; i < WILDCARD_SEARCH_SLOTS; i++)
+                  if (!wildcard_searches[i].dir) { slot = i; break; }
+                if (slot == WILDCARD_SEARCH_SLOTS) {
+                  closedir(wildcard_searches[0].dir);
+                  wildcard_searches[0].dir = NULL;
+                  slot = 0;
+                }
+                ws = &wildcard_searches[slot];
+                ws->dir = dirp;
+                memcpy(ws->pattern, pattern, strlen(pattern) + 1);
+                ws->attrs = search_attr;
+                memcpy(ws->dir_linux, dir_linux, tlen + 1);
+                ws->id = wildcard_search_next_id++;
+                if (wildcard_search_next_id == 0) wildcard_search_next_id = 1;
+                /* Store search state in FCB reserved bytes for FindNext. */
+                ((char*)reg_fcb)[0x18] = (char)FCB_SEARCH_MAGIC;
+                ((char*)reg_fcb)[0x19] = (char)slot;
+                *(unsigned short*)(((char*)reg_fcb) + 0x1a) = (unsigned short)ws->id;
                 dta = (char*)mem + dta_linear;
-                memset(dta, 0, 37);
-                dta[0] = fcb_hdr[0] ? fcb_hdr[0] : (dir_state->drive - 'A' + 1);  /* Drive number (1-based). */
-                memcpy(dta + 1, fcb_hdr + 1, 11);  /* Filename.ext from search template. */
-                /* Bytes 12-13: current block = 0, bytes 14-15: record size = 0 (set by OPEN). */
-                tm = localtime(&st.st_mtime);
-                *(unsigned*)(dta + 16) = (unsigned)((sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
-                    0xffffffffU : st.st_size + (size_t)0);  /* File size (capped at 4GB). */
-                *(unsigned short*)(dta + 20) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 80) << 9;  /* Date. */
-                *(unsigned short*)(dta + 22) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;  /* Time. */
-                *(unsigned char*)&regs.rax = 0;  /* Found. */
+                if (fcb_wildcard_findnext(dta + dta_entry_off, ws, &attr)) {
+                  dta[dta_drv_off] = (char)drv_num;
+                  if (is_ext_fcb) {
+                    dta[0] = (char)0xff;
+                    memset(dta + 1, 0, 5);
+                    dta[6] = (char)attr;
+                  }
+                  *(unsigned char*)&regs.rax = 0;
+                } else {
+                  closedir(ws->dir); ws->dir = NULL;
+                  *(unsigned char*)&regs.rax = 0xff;
+                }
+               after_fcb_find:;
+              } else {
+                /* Exact (non-wildcard) FCB search — original code path.
+                 * DTA layout: [ext_hdr] + drive + dir_entry(32 bytes). */
+                char dos_path[16];
+                const char *fn;
+                struct stat st;
+                fcb_to_dos_path(reg_fcb, dos_path, dir_state->drive);
+                fn = get_linux_filename(dos_path);
+                if (DEBUG) fprintf(stderr, "debug: fcb_findfirst dos_path=(%s) fn=(%s)\n", dos_path, fn);
+                if (*fn == '\0' || stat(fn, &st) != 0) {
+                  *(unsigned char*)&regs.rax = 0xff;  /* Not found. */
+                } else {
+                  struct tm *tm;
+                  char *dta;
+                  char fcb_hdr[12];  /* Save FCB header — DTA may overlap the search FCB (e.g. COMP.COM). */
+                  unsigned char attr;
+                  unsigned size32;
+                  memcpy(fcb_hdr, reg_fcb, 12);
+                  dta = (char*)mem + dta_linear;
+                  memset(dta, 0, dta_size);
+                  /* Compute attribute. */
+                  attr = S_ISDIR(st.st_mode) ? 0x10 : 0x00;
+                  if (!(st.st_mode & 0200)) attr |= 0x01;
+                  { unsigned char xattr_val;
+#ifdef __APPLE__
+                    if (getxattr(fn, "com.msdos.attr", &xattr_val, 1, 0, 0) == 1) {
+#else
+                    if (getxattr(fn, "user.msdos.attr", &xattr_val, 1) == 1) {
+#endif
+                      attr |= xattr_val & 0x26;
+                    } else if (!S_ISDIR(st.st_mode)) {
+                      attr |= 0x20;
+                    }
+                  }
+                  if (is_ext_fcb) {
+                    dta[0] = (char)0xff;
+                    /* dta[1..5] = 0 (already zeroed) */
+                    dta[6] = (char)attr;
+                  }
+                  dta[dta_drv_off] = fcb_hdr[0] ? fcb_hdr[0] : (char)(dir_state->drive - 'A' + 1);
+                  memcpy(dta + dta_entry_off, fcb_hdr + 1, 11);  /* 8.3 name into dir_entry */
+                  dta[dta_entry_off + 11] = (char)attr;           /* dir_attr */
+                  tm = localtime(&st.st_mtime);
+                  *(unsigned short*)(dta + dta_entry_off + 22) = (unsigned short)(
+                      tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11);  /* dir_time */
+                  *(unsigned short*)(dta + dta_entry_off + 24) = (unsigned short)(
+                      tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 80) << 9);  /* dir_date */
+                  size32 = (unsigned)((sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
+                      0xffffffffU : st.st_size + (size_t)0);
+                  *(unsigned short*)(dta + dta_entry_off + 28) = (unsigned short)size32;          /* dir_size_l */
+                  *(unsigned short*)(dta + dta_entry_off + 30) = (unsigned short)(size32 >> 16);  /* dir_size_h */
+                  *(unsigned char*)&regs.rax = 0;  /* Found. */
+                }
               }
             }
           } else if (ah == 0x0f) {  /* FCB open file. */
@@ -4157,13 +4416,19 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
           } else if (ah == 0x69) {  /* Get/set disk serial number (DOS 4.0+). */
             const unsigned char al = (unsigned char)regs.rax;
+            const int drv69 = (*(unsigned char*)&regs.rbx == 0) ? (dir_state->drive - 'A') : ((*(unsigned char*)&regs.rbx) - 1);
+            char *buf = (char*)mem + (sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+            init_volume_labels();
             if (al == 0) {  /* Get serial number. */
               /* DS:DX -> buffer: word info_level (0), dword serial_number, 11-byte volume_label, 8-byte fs_type. */
-              char *buf = (char*)mem + (sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
               memset(buf, 0, 25);
               buf[2] = 0x01; buf[3] = 0x23; buf[4] = 0x45; buf[5] = 0x67;  /* Dummy serial 0x67452301. */
-              memcpy(buf + 6, "NO NAME    ", 11);  /* Volume label. */
+              memcpy(buf + 6, ((unsigned)drv69 < DRIVE_COUNT) ? volume_labels[drv69] : "NO NAME    ", 11);
               memcpy(buf + 17, "FAT12   ", 8);     /* FS type. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0 (success). */
+            } else if (al == 1) {  /* Set serial number. */
+              /* buf+6 has the 11-byte volume label. */
+              if ((unsigned)drv69 < DRIVE_COUNT) memcpy(volume_labels[drv69], buf + 6, 11);
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0 (success). */
             } else {
               goto fatal_int;
