@@ -1772,6 +1772,7 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
   }
   /* !!! TODO(pts): Make the default permissive in general, and enable these protections only on a flag. */
   if (int_num - 0x22 + 0U <= 0x24 - 022 +0U ||  /* Application Ctrl-<Break> handler == 0x23. We allow 0x22..0x24. */
+      value_seg_ofs == 0 ||  /* Setting to null (0000:0000) — common DOS program cleanup on exit (e.g. ATTRIB.EXE restores INT 00). */
       value_seg_ofs == *p ||  /* Unchanged. */
       value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
       ((had_get_ints & 2) && int_num == 0x18) ||  /* TASM 3.2. */
