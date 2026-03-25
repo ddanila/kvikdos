@@ -4572,10 +4572,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rbx = 0;  /* AL=07h (get flags): BX=0 means no flags set. */
           } else if (ah == 0x12 && al == 0x2e) {  /* MultDOS MSG_RETRIEVAL (DOS 4.0 internal, MULT.INC sub 46). */
             /* COMMAND.COM calls this during init to get/set parse and critical error message handler
-             * addresses (DL selects sub-subfunction).  GET: return ES:DI=0:0 (no existing handler).
-             * SET: silently ignore — kvikdos has no message retrieval system. */
-            *(unsigned short*)&regs.rdi = 0;
-            SET_SREG(es, 0);
+             * addresses (DL selects sub-subfunction).  GET (even DL): return ES:DI=0:0 (no existing
+             * handler).  SET (odd DL): silently ignore — kvikdos has no message retrieval system.
+             * Critical: SET must not clobber ES:DI, as the caller uses them afterward. */
+            if (!(*(unsigned char*)&regs.rdx & 1)) {  /* GET subfunctions only. */
+              *(unsigned short*)&regs.rdi = 0;
+              SET_SREG(es, 0);
+            }
           } else if (ah == 0x19) {  /* COMMAND.COM shell multiplex (DOS 4.0). */
             /* AX=1902h: mult_shell_get — outer shell supplying next command.
              * AX=1903h: mult_shell_brk — outer shell requesting ^C termination.
