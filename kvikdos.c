@@ -3150,7 +3150,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
           } else if (ah == 0x44) {  /* I/O control (ioctl). */
             const unsigned char al = (unsigned char)regs.rax;
-            if (al == 1 && (*(unsigned short*)&regs.rdx >> 8)) goto error_invalid_parameter;
+            /* DOS spec says DH must be 0 for Set (al==1), but real DOS 4.0
+             * ignores DH. COMMAND.COM 4.0 passes DH=0x80 (leftover from Get).
+             * Don't reject it — the Set handler already ignores the value. */
             if (al < 2) {  /* Get device information (1), set device information (2). */
               const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
               struct stat st;
@@ -3163,14 +3165,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 *(unsigned short*)&regs.rdx = S_ISCHR(st.st_mode) ? 1 << 15 /* reserved */ | 1 << 5  /* binary */ | 1 << 7  /* character device */ : 1 << 15 | (fake_drive - 'A') /* regular file on block device */;
                 if (DEBUG) fprintf(stderr, "debug: ioctl get_device_info dos_fd=%d linux_fd=%d result=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
                 *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
-              } else {
-                if (DEBUG) fprintf(stderr, "debug: ioctl get_device_info dos_fd=%d linux_fd=%d value=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
-                if (!S_ISCHR(st.st_mode)) goto error_invalid_drive;  /* We want to indicate that it's not a character device. */
-                /* TLIB 3.01 sets (dx & 0x80) to zero, to disable binary mode (and enable translation). */
-                /* We just ignore the setting. */
+              } else {  /* Set device information (al==1). */
+                if (DEBUG) fprintf(stderr, "debug: ioctl set_device_info dos_fd=%d linux_fd=%d value=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
+                /* TLIB 3.01 sets (dx & 0x80) to zero, to disable binary mode (and enable translation).
+                 * COMMAND.COM 4.0 does Get then Set on stdout to flip binary mode.
+                 * We just ignore the setting for all device types. */
               }
             } else if (al == 8) {  /* Get whether drive is removable. */
-              unsigned char bl = (unsigned char)regs.rax;
+              unsigned char bl = (unsigned char)regs.rbx;  /* BL = drive number (0=default, 1=A, 2=B, 3=C). */
               if (bl == 0) bl = dir_state->drive - 'A' + 1;
               if (bl > DRIVE_COUNT || !dir_state->linux_mount_dir[(int)bl - 1]) goto error_invalid_drive;
               *(unsigned char*)&regs.rax = bl > 2;  /* A: (1) and B: (2) are removable (0), C: (3) etc. aren't (1). */
