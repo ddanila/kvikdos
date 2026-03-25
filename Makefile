@@ -41,6 +41,7 @@ kvikdos: $(SRCDEPS) $(CPU8086_DEPS)
 	$(CC) $(CPU8086_CFLAGS) -c -o cpu8086.o cpu8086.c
 	$(CC) -s -o $@ kvikdos.o cpu8086.o
 	@rm -f kvikdos.o cpu8086.o
+	@cp -f $@ kvikdos-soft
 endif
 
 kvikdos32: $(SRCDEPS)
