@@ -4579,11 +4579,26 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rax = 0;
             *(unsigned short*)&regs.rbx = 0;  /* AL=07h (get flags): BX=0 means no flags set. */
           } else if (ah == 0x12 && al == 0x2e) {  /* MultDOS MSG_RETRIEVAL (DOS 4.0 internal, MULT.INC sub 46). */
-            /* COMMAND.COM calls this during init to get/set parse and critical error message handler
-             * addresses (DL selects sub-subfunction).  GET: return ES:DI=0:0 (no existing handler).
-             * SET: silently ignore — kvikdos has no message retrieval system. */
-            *(unsigned short*)&regs.rdi = 0;
-            SET_SREG(es, 0);
+            /* COMMAND.COM registers message handler addresses during init via SET (odd DL).
+             * Child programs query them via GET (even DL) to display extended/parse/critical
+             * error messages.  DL subfunctions:
+             *   00/01: GET/SET extended error handler
+             *   02/03: GET/SET parse error handler
+             *   04/05: GET/SET critical error handler
+             *   06:    GET file system dependent (IFSFUNC)
+             *   08/09: GET/SET READ_DISK_PROC address */
+            { static unsigned msg_handlers[5];  /* seg:ofs for DL=0..8 (indexed by DL>>1, max 5 slots). */
+              const unsigned char dl = *(unsigned char*)&regs.rdx;
+              const unsigned slot = dl >> 1;
+              if (slot < 5) {
+                if (dl & 1) {  /* SET: store ES:DI from caller. */
+                  msg_handlers[slot] = (unsigned)sregs.es.selector << 16 | *(unsigned short*)&regs.rdi;
+                } else {  /* GET: return stored ES:DI. */
+                  *(unsigned short*)&regs.rdi = (unsigned short)msg_handlers[slot];
+                  SET_SREG(es, msg_handlers[slot] >> 16);
+                }
+              }
+            }
           } else if (ah == 0x19) {  /* COMMAND.COM shell multiplex (DOS 4.0). */
             /* AX=1902h: mult_shell_get — outer shell supplying next command.
              * AX=1903h: mult_shell_brk — outer shell requesting ^C termination.
