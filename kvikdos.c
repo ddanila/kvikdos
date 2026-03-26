@@ -4670,12 +4670,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       }
      case KVM_EXIT_MMIO:
       { const char mmio_len = run->mmio.len;
-        const unsigned addr = (unsigned)run->mmio.phys_addr;
+        /* Real-mode memory accesses wrap at 20 bits when A20 is disabled. KVM
+         * reports the unfurled physical address, so fold it back before
+         * checking which guest memory slot is being accessed.
+         */
+        const unsigned addr = (unsigned)run->mmio.phys_addr & 0xfffffU;
         char highmsg[2];
         /* CS:IP points to the instruction doing the memory operation (not after). */
         if (sizeof(run->mmio.phys_addr) > 4 && run->mmio.phys_addr >> (32 * (sizeof(run->mmio.phys_addr) > 4))) {  /* Physical address is larger than 32 bits. */
           highmsg[0] = '+'; highmsg[1] = '\0';
           goto bad_memory_access;
+        } else if (addr >= GUEST_MEM_MODULE_START && addr + mmio_len <= DOS_MEM_LIMIT) {
+          if (run->mmio.is_write) {
+            memcpy((char*)mem + addr, run->mmio.data, mmio_len);
+          } else {
+            memcpy(run->mmio.data, (char*)mem + addr, mmio_len);
+          }
         } else if (addr == 0xfffea && mmio_len == 1 && !run->mmio.is_write && (sphinx_cmm_flags & 3) == 3) {
           /* SPHiNX C-- 1.04 compiler does this, just ignore. */
         } else if (addr - (ENV_PARA << 4) < (PROGRAM_MCB_PARA - 1 - ENV_PARA) << 4 && run->mmio.is_write && mmio_len <= 16) {  /* Overwrites environment area. */
