@@ -35,8 +35,56 @@ instruction-level code coverage, faster startup.
     Post-process: map physical addresses back to source lines via VC.LST.
     Only works with software CPU path (macOS, or Linux with `--no-kvm`).
 
-## Smoke test
+## Current status
 
-Use VC.COM binary: run under kvikdos, feed keystrokes, read video buffer
-at B800:0000, assert expected screen content. Each gap fixed = more of
-VC.COM works.
+Phases 1-3 are done. VC.COM 4.05 boots and renders its TUI (directory
+panels, command line, F1-F10 bar) in the video buffer. Additional fixes
+needed during bring-up: memory management (free Z-type MCBs, relaxed
+MCB validation), permissive interrupt vector get/set, INT 10h AH=FE,
+INT 33h mouse stub, IOCTL 0x0E stub, --video-mode flag.
+
+## Threaded test harness (next major task)
+
+Goal: in-process e2e tests for DOS programs running under kvikdos.
+
+Architecture:
+- **Thread 1 (emulator)**: runs `run_dos_prog()` — the kvikdos main loop
+- **Thread 2 (test driver)**: polls `vga_mem` and injects keystrokes
+
+API sketch:
+- `wait_for_text(row, col, "expected", timeout_ms)` — scan vga_mem
+  in a loop until the text appears or timeout
+- `send_key(scancode, ascii)` — push into a shared keystroke queue
+  that INT 16h reads from instead of stdin
+- `assert_screen(row, col, "expected")` — immediate check
+
+Implementation notes:
+- Expose `vga_mem` pointer and a keystroke ring buffer as globals
+- kvikdos is a monolithic .c file; no refactoring needed — just add
+  the globals and a pthread-based test runner (test_vc.c)
+- INT 16h AH=00/10 (wait for key) reads from the shared queue;
+  AH=01/11 (check buffer) peeks without blocking
+- Test program links kvikdos.o + cpu8086.o + test_vc.o
+
+Example test scenario:
+```
+start_kvikdos("VC.COM");
+wait_for_text(24, 0, "C:\\>", 5000);       // command line appeared
+wait_for_text(0, 0, "C:\\", 5000);          // directory path
+send_key(KEY_F10, 0);                       // quit
+wait_for_text(12, 30, "Quit", 2000);        // quit dialog
+send_key(KEY_ENTER, '\r');                   // confirm
+wait_for_exit(2000);                         // VC.COM exits
+```
+
+## Phase 4: Command execution
+
+9. **INT 2Eh (execute command)** — Medium effort. Consider using real
+   COMMAND.COM from ddanila/msdos repo via INT 21h/4Bh spawn instead
+   of reimplementing.
+
+## Code coverage instrumentation (software CPU only)
+
+10. Record `(CS<<4)+IP` bitmap during `cpu_exec()`, dump on exit.
+    Post-process: map physical addresses back to source lines via VC.LST.
+    Only works with software CPU path (macOS, or Linux with `--no-kvm`).
