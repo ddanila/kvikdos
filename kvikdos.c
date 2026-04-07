@@ -2423,6 +2423,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   char port_0x40_tick;
   unsigned char video_write_step;
   char video_byte_written;
+  unsigned char vga_mem[4000];  /* Text-mode video buffer at B800:0000. 80x25x2 = 4000 bytes (char+attr pairs). */
   const char *stdout_write_p;
   const char *stdout_write_end;
   char is_stdout_write_cursor;
@@ -2455,6 +2456,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
   video_write_step = 0;
   video_byte_written = 0;  /* Pacify uninitialized warnings. */
+  { unsigned u; for (u = 0; u < sizeof(vga_mem); u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }  /* Clear video buffer: space + light gray on black. */
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
   cleanup_fn[0] = '\0';
@@ -2637,7 +2639,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       exit(252);
     }
 #else /* !__linux__ */
-    if (cpu8086_run(&regs, &sregs, run, mem, DOS_MEM_LIMIT) < 0) {
+    if (cpu8086_run(&regs, &sregs, run, mem, DOS_MEM_LIMIT, vga_mem, sizeof(vga_mem)) < 0) {
       fprintf(stderr, "fatal: cpu8086_run internal error\n");
       exit(252);
     }
@@ -4460,7 +4462,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rax = 80 << 8 | 3;  /* 80x25. */
             ((unsigned char*)&regs.rbx)[1] = 0;  /* BH := page (0). */
           } else if (ah == 0x08) {  /* Read character and attribute at cursor. */
-            *(unsigned short*)&regs.rax = 0;  /* AH == attribute, AL == character. */
+            { const unsigned short cursor_pos = *(unsigned short*)((char*)mem + 0x450);
+              const unsigned ofs = ((cursor_pos >> 8) * 80 + (cursor_pos & 0xff)) * 2;
+              if (ofs + 1 < sizeof(vga_mem)) {
+                *(unsigned short*)&regs.rax = vga_mem[ofs + 1] << 8 | vga_mem[ofs];  /* AH=attr, AL=char. */
+              } else {
+                *(unsigned short*)&regs.rax = 0;
+              }
+            }
           } else if (ah == 0x09 ||  /* Write Character and Attribute at Cursor Position (it does not move the cursor). */
                      ah == 0x0a) {  /* Write Character Only at Current Cursor Position. */
             const unsigned char page = *(unsigned short*)&regs.rbx >> 8;  /* Page in BH. */
@@ -4528,6 +4537,67 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
             *(unsigned short*)&regs.rax = 80 << 8 | 3;  /* 80x25. */
             ((unsigned char*)&regs.rbx)[1] = 0;  /* BH := page (0). */
+          } else if (ah == 0x00) {  /* Set video mode. */
+            /* AL = mode. We only support mode 3 (80x25 text). Just clear the video buffer. */
+            { unsigned u; for (u = 0; u < sizeof(vga_mem); u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }
+            *(unsigned short*)((char*)mem + 0x450) = 0;  /* Cursor pos page 0: row=0, col=0. */
+            *(unsigned char*)((char*)mem + 0x449) = 3;  /* BDA: current video mode = 3. */
+            *(unsigned short*)((char*)mem + 0x44a) = 80;  /* BDA: columns per row. */
+            *(unsigned short*)((char*)mem + 0x44c) = 4000;  /* BDA: video page size in bytes. */
+            *(unsigned short*)((char*)mem + 0x44e) = 0;  /* BDA: active page offset. */
+            *(unsigned char*)((char*)mem + 0x462) = 0;  /* BDA: active display page. */
+            *(unsigned short*)((char*)mem + 0x463) = 0x3d4;  /* BDA: CRT base port. */
+            *(unsigned char*)((char*)mem + 0x484) = 24;  /* BDA: rows on screen minus 1. */
+          } else if (ah == 0x06 || ah == 0x07) {  /* Scroll window up (06) / down (07). */
+            const unsigned char lines = (unsigned char)regs.rax;
+            const unsigned char attr = ((unsigned char*)&regs.rbx)[1];  /* BH = fill attribute. */
+            const unsigned char row_top = ((unsigned char*)&regs.rcx)[1];  /* CH. */
+            const unsigned char col_left = (unsigned char)regs.rcx;  /* CL. */
+            const unsigned char row_bot = ((unsigned char*)&regs.rdx)[1];  /* DH. */
+            const unsigned char col_right = (unsigned char)regs.rdx;  /* DL. */
+            const unsigned width = (col_right >= col_left) ? col_right - col_left + 1 : 0;
+            unsigned r;
+            if (lines == 0 || lines > row_bot - row_top) {
+              /* Clear the entire window. */
+              for (r = row_top; r <= row_bot && r < 25; ++r) {
+                unsigned c;
+                for (c = 0; c < width && col_left + c < 80; ++c) {
+                  vga_mem[(r * 80 + col_left + c) * 2] = ' ';
+                  vga_mem[(r * 80 + col_left + c) * 2 + 1] = attr;
+                }
+              }
+            } else if (ah == 0x06) {  /* Scroll up. */
+              for (r = row_top; r <= row_bot && r < 25; ++r) {
+                unsigned c;
+                for (c = 0; c < width && col_left + c < 80; ++c) {
+                  unsigned dst = (r * 80 + col_left + c) * 2;
+                  if (r + lines <= row_bot) {
+                    unsigned src = ((r + lines) * 80 + col_left + c) * 2;
+                    vga_mem[dst] = vga_mem[src];
+                    vga_mem[dst + 1] = vga_mem[src + 1];
+                  } else {
+                    vga_mem[dst] = ' ';
+                    vga_mem[dst + 1] = attr;
+                  }
+                }
+              }
+            } else {  /* Scroll down (ah == 0x07). */
+              for (r = row_bot; r >= row_top && r < 25; --r) {
+                unsigned c;
+                for (c = 0; c < width && col_left + c < 80; ++c) {
+                  unsigned dst = (r * 80 + col_left + c) * 2;
+                  if (r >= row_top + lines) {
+                    unsigned src = ((r - lines) * 80 + col_left + c) * 2;
+                    vga_mem[dst] = vga_mem[src];
+                    vga_mem[dst + 1] = vga_mem[src + 1];
+                  } else {
+                    vga_mem[dst] = ' ';
+                    vga_mem[dst + 1] = attr;
+                  }
+                }
+                if (r == 0) break;  /* Prevent unsigned wraparound. */
+              }
+            }
           } else {
             goto fatal_int;
           }
@@ -4756,6 +4826,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else if (addr == 0xa003e && mmio_len == 2 && !run->mmio.is_write) {
           /* Microsoft Macro Assembler 6.00B driver masm.exe. */
           *(unsigned short*)run->mmio.data = 0;
+        } else if (addr >= 0xb8000 && addr + mmio_len <= 0xb8000 + sizeof(vga_mem)) {
+          /* CGA/text-mode video memory at B800:0000. */
+          if (run->mmio.is_write) {
+            memcpy(vga_mem + (addr - 0xb8000), run->mmio.data, mmio_len);
+          } else {
+            memcpy(run->mmio.data, vga_mem + (addr - 0xb8000), mmio_len);
+          }
         } else if (addr >= 0xa0000 && addr < 0x110000 && !run->mmio.is_write) {
           /* High memory reads (DOS/BIOS ROM area): return 0 for all fields.
            * Needed for MEM.EXE which reads INVARS (INT 21h/AH=52h) ExtendedMemory

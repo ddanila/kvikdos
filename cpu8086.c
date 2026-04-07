@@ -27,9 +27,13 @@
 static struct {
 	unsigned char *mem;
 	unsigned mem_size;
+	unsigned char *vga_mem;
+	unsigned vga_mem_size;  /* Typically 4000 (80x25x2). */
 	struct kvm_run *run;
 	int exit_pending;
 } g_ctx;
+
+#define VGA_BASE 0xb8000
 
 /* -------------------------------------------------------------------- */
 /* Memory access callbacks for XTulator CPU core.                       */
@@ -41,6 +45,9 @@ uint8_t cpu_read(CPU_t* cpu, uint32_t addr) {
 	addr &= 0xFFFFF; /* 1MB wrap */
 	if (addr < g_ctx.mem_size) {
 		return g_ctx.mem[addr];
+	}
+	if (addr - VGA_BASE < g_ctx.vga_mem_size) {
+		return g_ctx.vga_mem[addr - VGA_BASE];
 	}
 	/* MMIO: address beyond guest RAM. */
 	g_ctx.run->exit_reason = KVM_EXIT_MMIO;
@@ -56,6 +63,10 @@ void cpu_write(CPU_t* cpu, uint32_t addr, uint8_t value) {
 	addr &= 0xFFFFF;
 	if (addr < g_ctx.mem_size) {
 		g_ctx.mem[addr] = value;
+		return;
+	}
+	if (addr - VGA_BASE < g_ctx.vga_mem_size) {
+		g_ctx.vga_mem[addr - VGA_BASE] = value;
 		return;
 	}
 	/* MMIO write. */
@@ -261,7 +272,8 @@ static void regs_cpu_to_kvm(CPU_t *cpu, struct kvm_regs *regs,
 /* -------------------------------------------------------------------- */
 
 int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
-                struct kvm_run *run, void *mem, unsigned mem_size) {
+                struct kvm_run *run, void *mem, unsigned mem_size,
+                void *vga_mem, unsigned vga_mem_size) {
 	static CPU_t cpu;
 	static int initialized = 0;
 
@@ -273,6 +285,8 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 	/* Set up context for memory/IO callbacks. */
 	g_ctx.mem = (unsigned char *)mem;
 	g_ctx.mem_size = mem_size;
+	g_ctx.vga_mem = (unsigned char *)vga_mem;
+	g_ctx.vga_mem_size = vga_mem_size;
 	g_ctx.run = run;
 	g_ctx.exit_pending = 0;
 
