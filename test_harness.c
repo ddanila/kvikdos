@@ -201,3 +201,44 @@ int kviktest_wait_for_text_anywhere(const char *text, unsigned timeout_ms, int *
   }
   return 0;
 }
+
+void kviktest_coverage_enable(void) {
+  cpu8086_coverage_reset();
+  cpu8086_coverage_enable();
+}
+
+int kviktest_coverage_report(const char *prog_path) {
+  /* COM programs load at PSP_PARA:0100 = linear 0x1100. */
+  const unsigned code_start = 0x1100;
+  unsigned code_size = 0;
+  unsigned hit;
+  int pct;
+
+  /* Determine program size from file. */
+  { FILE *f = fopen(prog_path, "rb");
+    if (f) {
+      fseek(f, 0, SEEK_END);
+      code_size = (unsigned)ftell(f);
+      fclose(f);
+    }
+  }
+  if (code_size == 0) {
+    printf("Coverage: cannot determine program size for %s\n", prog_path);
+    return 0;
+  }
+
+  cpu8086_coverage_disable();
+  hit = cpu8086_coverage_count(code_start, code_size);
+  pct = (int)((unsigned long)hit * 100 / code_size);
+
+  printf("\n=== Coverage: %u / %u bytes hit = %d%% ===\n", hit, code_size, pct);
+  printf("  Program: %s (%u bytes)\n", prog_path, code_size);
+  printf("  Code range: 0x%05X - 0x%05X\n", code_start, code_start + code_size - 1);
+
+  /* Also report total unique addresses hit across full 1MB. */
+  { unsigned total = cpu8086_coverage_count(0, 0x100000);
+    printf("  Total unique addresses hit (1MB): %u\n", total);
+  }
+
+  return pct;
+}

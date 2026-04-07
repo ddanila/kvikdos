@@ -34,6 +34,11 @@ static struct {
 	int exit_pending;
 } g_ctx;
 
+/* Instruction coverage bitmap: 1 bit per byte in 1MB address space = 128KB.
+ * Set bit at (CS<<4)+IP before each instruction. */
+static unsigned char g_coverage_bitmap[1 << 17];  /* 128KB = 131072 bytes. */
+static int g_coverage_enabled;
+
 /* -------------------------------------------------------------------- */
 /* Memory access callbacks for XTulator CPU core.                       */
 /* These replace XTulator's memory.c — we use kvikdos's flat buffer.    */
@@ -303,6 +308,11 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 	 * call cpu_exec(cpu, 0xFFFFFFFF) instead of stepping one-by-one.
 	 */
 	while (!g_ctx.exit_pending) {
+		if (g_coverage_enabled) {
+			unsigned addr = ((unsigned)cpu.segregs[regcs] << 4) + cpu.ip;
+			addr &= 0xFFFFF;
+			g_coverage_bitmap[addr >> 3] |= (1 << (addr & 7));
+		}
 		cpu_exec(&cpu, 1);
 
 		/* HLT sets hltstate=1; translate to KVM_EXIT_HLT. */
@@ -317,4 +327,33 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 	regs_cpu_to_kvm(&cpu, regs, sregs);
 
 	return 0;
+}
+
+void cpu8086_coverage_enable(void) {
+	g_coverage_enabled = 1;
+}
+
+void cpu8086_coverage_disable(void) {
+	g_coverage_enabled = 0;
+}
+
+void cpu8086_coverage_reset(void) {
+	memset(g_coverage_bitmap, 0, sizeof(g_coverage_bitmap));
+}
+
+/* Count set bits in coverage bitmap within [start, start+size). */
+unsigned cpu8086_coverage_count(unsigned start, unsigned size) {
+	unsigned count = 0;
+	unsigned i;
+	unsigned end = start + size;
+	if (end > 0x100000) end = 0x100000;
+	for (i = start; i < end; ++i) {
+		if (g_coverage_bitmap[i >> 3] & (1 << (i & 7))) ++count;
+	}
+	return count;
+}
+
+/* Get raw bitmap pointer for external analysis. */
+const unsigned char *cpu8086_coverage_bitmap(void) {
+	return g_coverage_bitmap;
 }

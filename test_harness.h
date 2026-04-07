@@ -103,4 +103,17 @@ int kviktest_find_text(const char *text, int *out_row, int *out_col);
  */
 int kviktest_wait_for_text_anywhere(const char *text, unsigned timeout_ms, int *out_row, int *out_col);
 
+/*
+ * Enable instruction coverage tracking. Call before kviktest_start().
+ * Tracks which (CS<<4)+IP addresses are executed by the software CPU.
+ */
+void kviktest_coverage_enable(void);
+
+/*
+ * Print coverage report for the loaded program.
+ * prog_path: path to the .COM/.EXE file (used to determine code size).
+ * Returns coverage percentage (0-100).
+ */
+int kviktest_coverage_report(const char *prog_path);
+
 #endif /* TEST_HARNESS_H */

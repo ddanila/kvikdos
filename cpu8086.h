@@ -39,4 +39,11 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
                 struct kvm_run *run, void *mem, unsigned mem_size,
                 void *video_mem, unsigned video_mem_size, unsigned video_base);
 
+/* Instruction coverage: tracks which (CS<<4)+IP addresses were executed. */
+void cpu8086_coverage_enable(void);
+void cpu8086_coverage_disable(void);
+void cpu8086_coverage_reset(void);
+unsigned cpu8086_coverage_count(unsigned start, unsigned size);
+const unsigned char *cpu8086_coverage_bitmap(void);
+
 #endif /* CPU8086_H */
