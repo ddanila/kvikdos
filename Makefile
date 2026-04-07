@@ -15,7 +15,7 @@ CPU8086_DEPS = cpu8086.c cpu8086.h cpu8086_xt.h mini_kvm.h XTulator/XTulator/cpu
 all: $(ALL)
 
 clean:
-	rm -f $(ALL) kvikdos32 kvikdos64 kvikdos.static test_vc
+	rm -f $(ALL) kvikdos32 kvikdos64 kvikdos.static test_harness.o cpu8086_test.o
 
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
@@ -49,14 +49,14 @@ kvikdos: $(SRCDEPS) $(CPU8086_DEPS)
 	@cp -f $@ kvikdos-soft
 endif
 
-# Test harness: test_harness.c #includes kvikdos.c with KVIKDOS_TEST.
+# Test harness library: test_harness.c #includes kvikdos.c with KVIKDOS_TEST.
+# External projects (e.g. beta_kappa) link against these objects + their own test .c files.
 TEST_CFLAGS = -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -fno-strict-aliasing -Wno-overlength-strings $(XCFLAGS)
-test_vc: test_vc.c test_harness.c test_harness.h $(SRCDEPS) $(CPU8086_DEPS)
+test_harness.o: test_harness.c test_harness.h $(SRCDEPS) $(CPU8086_DEPS)
 	$(CC) $(TEST_CFLAGS) -c -o test_harness.o test_harness.c
-	$(CC) $(CPU8086_CFLAGS) -c -o cpu8086.o cpu8086.c
-	$(CC) $(TEST_CFLAGS) -c -o test_vc.o test_vc.c
-	$(CC) -o $@ test_vc.o test_harness.o cpu8086.o -lpthread
-	@rm -f test_vc.o test_harness.o cpu8086.o
+
+cpu8086_test.o: $(CPU8086_DEPS)
+	$(CC) $(CPU8086_CFLAGS) -c -o cpu8086_test.o cpu8086.c
 
 kvikdos32: $(SRCDEPS)
 	gcc -m32 -fno-pic -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
