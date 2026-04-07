@@ -79,6 +79,10 @@ int kviktest_start(const char *prog_path, const char *mount_dir) {
     emu_running = 0;
     return -1;
   }
+  /* Wait until the emulator has initialized the video buffer pointer. */
+  { unsigned wait = 0;
+    while (!g_dump_video_mem && emu_running && wait < 5000) { usleep(1000); wait++; }
+  }
   return 0;
 }
 
