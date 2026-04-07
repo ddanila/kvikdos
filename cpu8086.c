@@ -13,6 +13,7 @@
 
 #include "cpu8086.h"
 
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -38,6 +39,9 @@ static struct {
  * Set bit at (CS<<4)+IP before each instruction. */
 static unsigned char g_coverage_bitmap[1 << 17];  /* 128KB = 131072 bytes. */
 static int g_coverage_enabled;
+
+/* Abort flag: checked in the execution loop to force-exit the emulator. */
+volatile int g_cpu8086_abort;
 
 /* -------------------------------------------------------------------- */
 /* Memory access callbacks for XTulator CPU core.                       */
@@ -312,6 +316,15 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 			unsigned addr = ((unsigned)cpu.segregs[regcs] << 4) + cpu.ip;
 			addr &= 0xFFFFF;
 			g_coverage_bitmap[addr >> 3] |= (1 << (addr & 7));
+		}
+		if (g_cpu8086_abort) {
+			run->exit_reason = KVM_EXIT_SHUTDOWN;
+			g_ctx.exit_pending = 1;
+			break;
+		}
+		/* Yield periodically so other threads (test harness) can run. */
+		if (g_coverage_enabled && (cpu.ip & 0x3F) == 0) {
+			sched_yield();
 		}
 		cpu_exec(&cpu, 1);
 

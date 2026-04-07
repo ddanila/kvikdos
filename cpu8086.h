@@ -39,6 +39,9 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
                 struct kvm_run *run, void *mem, unsigned mem_size,
                 void *video_mem, unsigned video_mem_size, unsigned video_base);
 
+/* Abort flag: set to 1 to force the CPU loop to exit with KVM_EXIT_SHUTDOWN. */
+extern volatile int g_cpu8086_abort;
+
 /* Instruction coverage: tracks which (CS<<4)+IP addresses were executed. */
 void cpu8086_coverage_enable(void);
 void cpu8086_coverage_disable(void);

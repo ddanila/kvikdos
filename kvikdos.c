@@ -2751,9 +2751,15 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
         }
       }
      case KVM_EXIT_SHUTDOWN:  /* How do we trigger it? */
+#ifndef __linux__
+      if (g_cpu8086_abort) return 0;  /* Test harness requested shutdown. */
+#endif
       fprintf(stderr, "fatal: shutdown\n");
       exit(252);
      case KVM_EXIT_HLT:
+#ifndef __linux__
+      if (g_cpu8086_abort) return 0;  /* Test harness requested shutdown. */
+#endif
       if (sregs.cs.selector == INT_HLT_PARA && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
         const unsigned char int_num = ((unsigned)regs.rip - 1) & 0xff;
         const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
@@ -4740,7 +4746,8 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             /* All other mouse calls: silently ignore (no mouse). */
             *(unsigned short*)&regs.rax = 0;
           }
-        } else if (int_num == 0x28) {  /* DOS idle — called while waiting for input. No-op. */
+        } else if (int_num == 0x28) {  /* DOS idle — called while waiting for input. */
+          usleep(1000);  /* Yield CPU to other threads (test harness). */
         } else if (int_num == 0x2a) {  /* Network. */
           if (ah == 0x00) {  /* Network installation query. */
             /* By returning ah == 0x00 we indicate that the network is not installed. */

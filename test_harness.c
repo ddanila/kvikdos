@@ -92,19 +92,15 @@ int kviktest_stop(void) {
   if (!emu_running) return emu_exit_code;
   /* Signal the emulator to stop: set abort flag so blocking key reads return. */
   g_key_ring_abort = 1;
-  /* Also push some ESC keys to unblock any non-ring-buffer blocking reads. */
-  key_ring_push(KEY_ESC);
-  key_ring_push(KEY_ESC);
-  key_ring_push(KEY_ESC);
-  { unsigned wait = 0;
-    while (emu_running && wait < 2000) { usleep(10000); wait += 10; }
+  g_cpu8086_abort = 1;
+  /* Brief wait to let the emulator thread notice the abort flag. */
+  usleep(100000);
+  if (!emu_running) {
+    pthread_join(emu_thread, NULL);
   }
-  if (emu_running) {
-    pthread_cancel(emu_thread);
-  }
-  pthread_join(emu_thread, NULL);
   emu_running = 0;
   g_key_ring_abort = 0;
+  g_cpu8086_abort = 0;
   return emu_exit_code;
 }
 
