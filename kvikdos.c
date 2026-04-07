@@ -24,6 +24,13 @@
  * * MS-DOS 6.22 (source code not available).
  */
 
+/* When building for the test harness, export certain symbols. */
+#ifdef KVIKDOS_TEST
+#define KVIKDOS_STATIC /* non-static */
+#else
+#define KVIKDOS_STATIC static
+#endif
+
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
 #include <dirent.h>
 #include <signal.h>
@@ -454,8 +461,37 @@ static char dosfnbuf[DOS_PATH_SIZE];
 enum video_mode_t { VIDEO_VGA_COLOR = 0, VIDEO_EGA_MONO = 1 };
 
 /* Global pointer for video buffer dump on signal (SIGTERM/SIGINT). */
-static const unsigned char *g_dump_video_mem;
-static unsigned g_dump_video_size;
+KVIKDOS_STATIC const unsigned char *g_dump_video_mem;
+KVIKDOS_STATIC unsigned g_dump_video_size;
+
+/* Keystroke ring buffer for test harness (thread-safe via volatile + atomic-like access).
+ * Each entry is a 16-bit value: high byte = scancode, low byte = ASCII.
+ * Used when TtyState.tty_in_fd == -3 (test/fake key mode). */
+#define KEY_RING_SIZE 64
+static volatile unsigned short g_key_ring[KEY_RING_SIZE];
+static volatile unsigned g_key_ring_head;  /* Next write position. */
+static volatile unsigned g_key_ring_tail;  /* Next read position. */
+static volatile int g_key_ring_abort;  /* Set to 1 to unblock waiting readers. */
+
+KVIKDOS_STATIC void key_ring_push(unsigned short key) {
+  unsigned next_head = (g_key_ring_head + 1) % KEY_RING_SIZE;
+  while (next_head == g_key_ring_tail) { usleep(1000); }  /* Spin if full. */
+  g_key_ring[g_key_ring_head] = key;
+  g_key_ring_head = next_head;
+}
+
+static int key_ring_peek(unsigned short *key_out) {
+  if (g_key_ring_tail == g_key_ring_head) return 0;  /* Empty. */
+  *key_out = g_key_ring[g_key_ring_tail];
+  return 1;
+}
+
+static int key_ring_pop(unsigned short *key_out) {
+  if (g_key_ring_tail == g_key_ring_head) return 0;  /* Empty. */
+  *key_out = g_key_ring[g_key_ring_tail];
+  g_key_ring_tail = (g_key_ring_tail + 1) % KEY_RING_SIZE;
+  return 1;
+}
 
 static void dump_video_on_signal(int sig) {
   if (g_dump_video_mem && g_dump_video_size) {
@@ -2153,7 +2189,6 @@ static char should_skip_exec_program(char const *dos_filename, const char *args,
 typedef struct TtyState {
   int tty_in_fd;
   char is_tty_in_error;
-  const unsigned short *next_fake_key;
 } TtyState;
 
 
@@ -2165,7 +2200,7 @@ typedef struct EmuState {
 } EmuState;
 
 /* It's a cheap call, the real initialization is done in reset_emu. */
-static void init_emu(struct EmuState *emu) {
+KVIKDOS_STATIC void init_emu(struct EmuState *emu) {
   emu->kvm_fds.kvm_fd = -1;
   emu->mem = NULL;
 }
@@ -2285,12 +2320,19 @@ static void reset_emu(struct EmuState *emu) {
 }
 
 static void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsigned short *flags) {
-  if (tty_state->tty_in_fd == -3) {  /* Fake keys. */
-    *ax = *tty_state->next_fake_key;
-    if (ah & 1) {
-      *flags &= ~(1 << 6);  /* ZF=0, key available in buffer. */
-    } else {
-      if (++tty_state->next_fake_key == fake_keys + sizeof(fake_keys) / sizeof(fake_keys[0])) tty_state->next_fake_key = fake_keys;
+  if (tty_state->tty_in_fd == -3) {  /* Test harness: read from keystroke ring buffer. */
+    if (ah & 1) {  /* Check buffer, do not clear. */
+      if (g_key_ring_abort || key_ring_peek(ax)) {
+        if (g_key_ring_abort) *ax = 0x011b;  /* Fake ESC to break out of idle loop. */
+        *flags &= ~(1 << 6);  /* ZF=0, key available. */
+      } else {
+        *flags |= (1 << 6);  /* ZF=1, no key. */
+      }
+    } else {  /* Wait for keystroke and read. */
+      while (!key_ring_pop(ax)) {
+        if (g_key_ring_abort) { *ax = 0x011b; break; }  /* Unblocked by stop request (fake ESC). */
+        usleep(1000);
+      }
     }
   } else {
     /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
@@ -2417,7 +2459,7 @@ struct SpawnFrame {
   char *mem_snapshot;  /* malloc'd, DOS_MEM_LIMIT bytes */
 };
 
-static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
+KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
   int img_fd;
   struct kvm_fds kvm_fds;
   void *mem;
@@ -4698,6 +4740,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             /* All other mouse calls: silently ignore (no mouse). */
             *(unsigned short*)&regs.rax = 0;
           }
+        } else if (int_num == 0x28) {  /* DOS idle — called while waiting for input. No-op. */
         } else if (int_num == 0x2a) {  /* Network. */
           if (ah == 0x00) {  /* Network installation query. */
             /* By returning ah == 0x00 we indicate that the network is not installed. */
@@ -4751,6 +4794,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
              * AX=1903h: mult_shell_brk — outer shell requesting ^C termination.
              * Return AL=0 (not shell_action=0FFh) so COMMAND.COM reads from batch file normally. */
             *(unsigned char*)&regs.rax = 0;
+          } else if (*(unsigned short*)&regs.rax == 0x1680) {  /* Release time slice (idle yield). */
+            *(unsigned char*)&regs.rax = 0;  /* AL=0: call supported. */
           } else { fatal_uic:
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal_int;
@@ -5271,14 +5316,14 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
   return exit_code;
 }
 
-static void init_tty_state(TtyState *tty_state, int tty_in_fd) {
+KVIKDOS_STATIC void init_tty_state(TtyState *tty_state, int tty_in_fd) {
   tty_state->tty_in_fd = tty_in_fd;
   tty_state->is_tty_in_error = 0;
-  tty_state->next_fake_key = fake_keys;
 }
 
 /* --- */
 
+#ifndef KVIKDOS_TEST
 int main(int argc, char **argv) {
   ParsedCmdArgs cmd_args;
   (void)argc;
@@ -5340,3 +5385,4 @@ int main(int argc, char **argv) {
     return exit_code;
   }
 }
+#endif /* !KVIKDOS_TEST */
