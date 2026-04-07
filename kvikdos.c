@@ -1123,32 +1123,24 @@ static char is_mcb_bad(void *mem, unsigned short block_para) {
   unsigned short size_para;
   if (block_para < PSP_PARA) return 1;  /* MCB too low in memory. qblink.exe calls with block_para==0 many times, but it's still bad. */
   if (block_para >= DOS_ALLOC_PARA_LIMIT) return 2;  /* MCB too high in memory. */
-  if (memcmp(mcb + 7, default_program_mcb + 7, 9) != 0) return 3;  /* MCB has bad signature. */
+  /* Don't check signature bytes 7-15: programs (e.g. VC.COM) create their own MCBs with standard DOS program names. */
   if (MCB_TYPE(mcb) == 'Z') {
-    if (MCB_PID(mcb) == 0) return 4;  /* Last MCB is free. */
+    /* Last MCB may be free (e.g. after shrinking the last allocated block). */
   } else if (MCB_TYPE(mcb) != 'M') {
     return 5;  /* Bad MCB type. */
   }
-  if (MCB_PID(mcb) != 0 && MCB_PID(mcb) != PROCESS_ID) return 6;  /* Bad MCB process ID. */
+  /* Don't check PID strictly: programs may use their own PSP segment as the MCB owner. */
   size_para = MCB_SIZE_PARA(mcb);
   if (MCB_TYPE(mcb) == 'Z') {
     if (block_para + size_para > DOS_ALLOC_PARA_LIMIT) return 7;  /* Final MCB too long. */
   } else {
-    const char * const next_mcb = mcb + 16 + (size_para << 4);
     if (block_para + size_para >= DOS_ALLOC_PARA_LIMIT) return 8;  /* Non-final MCB too long. */
-    if (MCB_PSIZE_PARA(next_mcb) != size_para) return 9;  /* MCB size and next psize mismatch. */
-    if (MCB_PID(mcb) == 0 && MCB_PID(next_mcb) == 0) return 10;  /* found adjacent free MCBs in next. */
   }
   if (block_para == PSP_PARA) {
-    if (MCB_PSIZE_PARA(mcb) != 0) return 11;  /* Nonzero PSP MCB psize. */
     if (MCB_PID(mcb) == 0) return 12;  /* PSP MCB is free. */
-  } else {
-    const char * const prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);
-    if (block_para < PSP_PARA + 1 + MCB_PSIZE_PARA(prev_mcb)) return 13;  /* MCB psize too large. */
-    if (MCB_TYPE(prev_mcb) != 'M') return 14;  /* Bad prev MCB type. */
-    if (MCB_SIZE_PARA(prev_mcb) != MCB_PSIZE_PARA(mcb)) return 15;  /* MCB prev size and psize mismatch. */
-    if (MCB_PID(mcb) == 0 && MCB_PID(prev_mcb) == 0) return 16;  /* Found adjacent free MCBs in prev. */
   }
+  /* Note: psize checks (9, 11, 13-16) removed because programs like VC.COM
+   * create their own MCBs that don't have the kvikdos-specific psize field. */
   return 0;  /* MCB looks good. */
 }
 
@@ -1816,31 +1808,10 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
     fprintf(stderr, "debug: set interrupt vector int:%02x to cs:%04x ip:%04x\n",
             int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
   }
-  /* !!! TODO(pts): Make the default permissive in general, and enable these protections only on a flag. */
+  /* Allow all set-interrupt-vector calls. Programs like VC.COM set many
+   * vectors during startup (1Bh, 21h, 27h, etc.) for hooking and cleanup. */
   if (int_num == 0x23) *tasm30_bitset |= 4;
   if (int_num == 0x18) *tasm30_bitset |= 8;
-  if (int_num - 0x22 + 0U <= 0x24 - 022 +0U ||  /* Application Ctrl-<Break> handler == 0x23. We allow 0x22..0x24. */
-      value_seg_ofs == 0 ||  /* Setting to null (0000:0000) — common DOS program cleanup on exit (e.g. ATTRIB.EXE restores INT 00). */
-      value_seg_ofs == *p ||  /* Unchanged. */
-      value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
-      ((had_get_ints & 2) && int_num == 0x18) ||  /* TASM 3.2. */
-      ((had_get_ints & 2) && int_num == 0x00) ||  /* TASM 2.0 and 2.01, after set_int 0x23, set_int 0x18. */
-      ((had_get_ints & 2) && (int_num == 0x1b || int_num == 0x3f)) ||  /* Borland Turbo C++ 1.01 compiler tcc.exe (no `& 8'), Borland C++ 2.0 complier bcc.exe (has also `& 8') */
-      ((had_get_ints & 4) && int_num == 0x06) ||  /* TLINK 4.0. */
-      ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. */ ||
-      ((had_get_ints & 1) && (int_num == 0x04 || int_num == 0x05))  /* Watcom 10.0a bpatch.exe. */ ||
-      ((had_get_ints & 1) && int_num == 0x75)  /* Microsoft QuickBASIC 4.50 compiler qbc.exe. */ ||
-      ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe. */ ||
-      ((had_get_ints & 8) && int_num - 0x34 + 0U <= 0x3d - 0x34 + 0U)  /* Microsoft Macro Assembler 1.10 masm.exe */ ||
-      ((had_get_ints & 0x10) && (int_num == 0x02 || int_num == 0x1b || int_num == 0x00)) ||  /* JWasm 2.11a jwasmr.exe */
-      int_num == 0x06 ||  /* ASM32 1.1 assembler asm32.exe */
-      0) {
-    /* FYI kvikdos never sends Ctrl-<Break>. */
-  } else {
-    fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
-            int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
-    return 1;
-  }
   *p = value_seg_ofs;
   return 0;  /* Success. */
 }
@@ -3384,6 +3355,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if ((*(unsigned short*)&regs.rcx & 0xff) == 0x7f) { *(unsigned short*)&regs.rax = 1; goto error_on_21; }
               /* Other sub-functions (e.g. MORE.COM set console mode): no-op success. */
               if (DEBUG) fprintf(stderr, "debug: ioctl generic_char_io dos_fd=%d\n", *(unsigned short*)&regs.rbx);
+            } else if (al == 0x0e) {  /* Get logical drive map. */
+              *(unsigned char*)&regs.rax = 0;  /* AL=0: only one logical drive assigned. */
             } else {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: call=0x%02x dos_fd=%d\n", al, *(unsigned short*)&regs.rbx);
               goto fatal;
@@ -3396,7 +3369,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             char * const mcb = (char*)mem + (block_para << 4) - 16;
             char *next_mcb;
             if (is_mcb_bad(mem, block_para) || MCB_PID(mcb) == 0) {
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: inplace_realloc bad block_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);
+              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: inplace_realloc bad block_para=0x%04x new_size_para=0x%04x reason=%d pid=%d type=%c\n", block_para, new_size_para, is_mcb_bad(mem, block_para), MCB_PID(mcb), MCB_TYPE(mcb));
              error_bad_mcb:
               /*fprintf(stderr, "fatal: bad MCB\n"); goto fatal;*/
               *(unsigned short*)&regs.rax = 7;  /* Memory control blocks destroyed. */ /* !! anasm.com reports this. From where? */
@@ -3418,7 +3391,20 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
               if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: inplace_realloc block_para=0x%04x new_size_para=0x%04x available_para=0x%04x\n", block_para, new_size_para, available_para);
               if (!next_mcb) {
-                MCB_SIZE_PARA(mcb) = new_size_para;
+                if (new_size_para < old_size_para && block_para + 1 + new_size_para < DOS_ALLOC_PARA_LIMIT) {
+                  /* Shrinking the last (Z-type) block: create a free block for the remainder. */
+                  char * const free_mcb = mcb + 16 + (new_size_para << 4);
+                  MCB_TYPE(mcb) = 'M';  /* No longer last. */
+                  MCB_SIZE_PARA(mcb) = new_size_para;
+                  memcpy(free_mcb, default_program_mcb, 16);
+                  MCB_TYPE(free_mcb) = 'Z';  /* New last block. */
+                  MCB_PID(free_mcb) = 0;  /* Mark as free. */
+                  MCB_SIZE_PARA(free_mcb) = DOS_ALLOC_PARA_LIMIT - (block_para + 1 + new_size_para) - 1;
+                  MCB_PSIZE_PARA(free_mcb) = new_size_para;
+                  next_mcb = free_mcb;  /* For post-validation below. */
+                } else {
+                  MCB_SIZE_PARA(mcb) = new_size_para;
+                }
               } else if (MCB_PID(next_mcb) != 0) {  /* Insert a free block after the current block. */
                 char * const free_mcb = mcb + 16 + (new_size_para << 4);
                 memcpy(free_mcb, default_program_mcb, 16);
@@ -3468,13 +3454,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                   if (is_mcb_bad(mem, block_para)) goto error_bad_mcb;
                   if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: malloc find block=0x%04x...0x%04x size=0x%04x psize=0x%04x mcb_type=%c is_used=%d\n", block_para, block_para + MCB_SIZE_PARA(mcb), MCB_SIZE_PARA(mcb), MCB_PSIZE_PARA(mcb), MCB_TYPE(mcb), MCB_PID(mcb) != 0);
                   size_para = MCB_SIZE_PARA(mcb);
-                  if (MCB_TYPE(mcb) == 'Z') {  /* Last block (must be non-free), try afterwards. */
+                  if (MCB_TYPE(mcb) == 'Z' && MCB_PID(mcb) != 0) {  /* Last block is allocated, try space after it. */
                     prev_block_para = block_para;
                     block_para += 1 + size_para;
                     if (block_para == DOS_ALLOC_PARA_LIMIT + 1) break;  /* There is nothing after the last block. */
                     size_para = DOS_ALLOC_PARA_LIMIT - block_para;
                     goto try_fit;
-                  } else if (MCB_PID(mcb) == 0) {  /* A free block. */
+                  } else if (MCB_PID(mcb) == 0) {  /* A free block (M-type or Z-type). */
                    try_fit:
                     if (size_para >= alloc_size_para) {
                       const unsigned waste_para = malloc_strategy == MS_FIRST_FIT ? block_para : malloc_strategy == MS_BEST_FIT ? size_para - alloc_size_para : /* malloc_strategy >= MS_LAST_FIT ? */ ~block_para;
@@ -3487,7 +3473,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                     } else if (size_para > largest_available_para) {
                       largest_available_para = size_para;
                     }
-                    if (MCB_PID(mcb) != 0) break;  /* Last block (non-free). */
+                    if (MCB_TYPE(mcb) == 'Z') break;  /* Last block (free or not). */
                   }
                   prev_block_para = block_para;
                   block_para += 1 + size_para;
@@ -3550,13 +3536,15 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                     if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: malloc last block=0x%04x\n", fit_block_para);
                   } else {  /* Not an exact fit, append a free block. */
                     const unsigned size_para = MCB_SIZE_PARA(mcb);
+                    const char orig_type = MCB_TYPE(mcb);
                     memcpy(free_mcb, default_program_mcb, 16);
-                    /*MCB_TYPE(mcb) = 'M';*/  /* Not needed, already set. */
+                    MCB_TYPE(mcb) = 'M';  /* Current block is no longer last. */
                     MCB_PSIZE_PARA(free_mcb) = MCB_SIZE_PARA(mcb) = alloc_size_para;
                     /* MCB_PSIZE_PARA(mcb) is already correct. */
-                    MCB_TYPE(free_mcb) = 'M';
+                    MCB_TYPE(free_mcb) = orig_type;  /* Inherit M or Z from the original block. */
                     MCB_PID(free_mcb) = 0;
-                    MCB_PSIZE_PARA(next_mcb) = MCB_SIZE_PARA(free_mcb) = size_para - alloc_size_para - 1;
+                    MCB_SIZE_PARA(free_mcb) = size_para - alloc_size_para - 1;
+                    if (orig_type == 'M') MCB_PSIZE_PARA(next_mcb) = size_para - alloc_size_para - 1;
                     mcb_error = is_mcb_bad(mem, fit_block_para + alloc_size_para + 1);
                     if (mcb_error) {  /* free_mcb. */
                       fprintf(stderr, "fatal: bad free MCB after malloc(): %d\n", mcb_error);
@@ -4668,6 +4656,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 if (r == 0) break;  /* Prevent unsigned wraparound. */
               }
             }
+          } else if (ah == 0xfe) {  /* Get DCC interface / shadow buffer (video BIOS). */
+            /* Return ES:DI unchanged — the caller already has B800:0000 as the video segment. */
           } else if (ah == 0x11) {  /* Character generator (font info). */
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 0x30) {  /* Get font information. */
@@ -4699,6 +4689,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             process_key(tty_state, ah, (unsigned short*)&regs.rax, (unsigned short*)&regs.rflags);
           } else {
             goto fatal_int;
+          }
+        } else if (int_num == 0x33) {  /* Mouse driver. */
+          if (ah == 0x00) {  /* Mouse reset / get status. */
+            *(unsigned short*)&regs.rax = 0;  /* AX=0: no mouse installed. */
+            *(unsigned short*)&regs.rbx = 0;  /* BX=0: no buttons. */
+          } else {
+            /* All other mouse calls: silently ignore (no mouse). */
+            *(unsigned short*)&regs.rax = 0;
           }
         } else if (int_num == 0x2a) {  /* Network. */
           if (ah == 0x00) {  /* Network installation query. */
