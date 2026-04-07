@@ -3269,29 +3269,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (get_int_num == 0x18) { had_get_ints |= 2; tasm30_bitset |= 0x10; }  /* TASM 3.0, TASM 3.2, Borland C++ 2.0 compiler bcc.exe for memory allocation. */
             if (get_int_num == 0x06) had_get_ints |= 4;  /* TLINK 4.0. */
             if ((had_get_ints & 8) && get_int_num == 0x34) had_get_ints |= 0x10;  /* JWasm 2.11a jwasmr.exe */
-            /* !!! TODO(pts): Make the default permissive in general, and enable these protections only on a flag. */
-            if ((had_get_ints & 1) ||
-                get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U ||  /* Microsoft BASIC Professional Development System 7.10 linker pblink.exe gets interrupt vector 0x24. */
-                get_int_num == 0x18 ||  /* TASM 3.2, used for memory allocation. */
-                get_int_num == 0x06 ||  /* TLINK 4.0. */
-                get_int_num == 0x67 ||  /* WLINK 7.0. */
-                get_int_num == 0x03 ||  /* DEBUG.COM saves/restores INT 03 (breakpoint). */
-                get_int_num == 0x01 ||  /* DEBUG.COM saves/restores INT 01 (single-step). */
-                get_int_num == 0x02 ||  /* DEBUG.COM saves/restores INT 02 (NMI). */
-                get_int_num == 0x21 ||  /* ASSIGN.COM saves INT 21 to hook it. */
-                get_int_num == 0x25 ||  /* ASSIGN.COM saves/restores INT 25 (absolute disk read). */
-                get_int_num == 0x26 ||  /* ASSIGN.COM saves/restores INT 26 (absolute disk write). */
-                get_int_num == 0x2f ||  /* GRAFTABL.COM checks INT 2F (multiplex) for TSR presence. */
-                ((had_get_ints & 0x10) && (get_int_num - 0x34 + 0U <= 0x3d - 0x34 + 0U || get_int_num == 0x02 || get_int_num == 0x1b)) ||  /* JWasm 2.11a jwasmr.exe */
-                ((had_get_ints & 2) && (get_int_num == 0x1b || get_int_num == 0x3f)) ||  /* Borland Turbo C++ 1.01 compiler tcc.exe, Borland C++ 2.0 complier bcc.exe */
-               0) {
+            /* Allow all get-interrupt-vector calls. Programs like VC.COM query many
+             * vectors during startup (22h-27h, 2Fh, etc.) for TSR detection and hooking. */
+            {
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
               if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
               (*(unsigned short*)&regs.rbx) = pp[0];
               SET_SREG(es, pp[1]);
-            } else {
-              fprintf(stderr, "fatal: unsupported get interrupt vector int:%02x\n", get_int_num);
-              goto fatal;
             }
           } else if (ah == 0x0b) {  /* Check input status. */
             *(unsigned char*)&regs.rax = 0;  /* No input ready. 0xff would be input. */
