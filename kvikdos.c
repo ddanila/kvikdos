@@ -2616,7 +2616,15 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18; 1 << 2: int 0x06, 1 << 3: Get DOS version, 1 << 4: 0x34. */
   tasm30_bitset = 0;
   had_get_first_mcb = 0;
-  tick_count = 0;
+  { /* Initialize tick_count from wall clock: ticks since midnight at ~18.2 Hz.
+     * 1193182/65536 = 18 + 13318/65536 ~= 18.2065 Hz. Split to avoid 64-bit math (C89). */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    { const unsigned s = (unsigned)(tv.tv_sec % 86400);
+      tick_count = s * 18U + s * 13318U / 65536U + (unsigned)tv.tv_usec * 18U / 1000000U;
+    }
+    *(unsigned*)((char*)mem + 0x46c) = tick_count;  /* BDA timer tick counter. */
+  }
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
   verify_flag = 0;
@@ -2668,6 +2676,15 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     }
 #endif /* __linux__ */
     if (DEBUG) dump_regs("debug", &regs, &sregs);
+
+    /* Update BDA timer (0040:006C) from wall clock on each VM exit. */
+    { struct timeval tv;
+      gettimeofday(&tv, NULL);
+      { const unsigned s = (unsigned)(tv.tv_sec % 86400);
+        tick_count = s * 18U + s * 13318U / 65536U + (unsigned)tv.tv_usec * 18U / 1000000U;
+      }
+      *(unsigned*)((char*)mem + 0x46c) = tick_count;
+    }
 
     switch (run->exit_reason) {
      case KVM_EXIT_IO:
@@ -4238,6 +4255,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
               malloc_strategy = *(unsigned short*)&regs.rbx;
               if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: set malloc strategy=%u\n", malloc_strategy);
+            } else if (al == 0x02) {  /* Get UMB link state. */
+              *(unsigned short*)&regs.rax = 0;  /* UMBs not linked. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else if (al == 0x03) {  /* Set UMB link state. */
+              /* BX=0: unlink, BX=1: link. We don't support UMBs, just report success. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             } else {
               goto error_invalid_parameter;
             }
@@ -4640,7 +4663,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           }
         } else if (int_num == 0x1a) {  /* Timer. */
           if (ah == 0x00) {  /* Read system clock counter. */
-            ++tick_count;  /* We don't emulate a real clock, we just increment the tick counter whenever queried. */
+            /* tick_count is already updated from wall clock on each VM exit. */
             *(unsigned char*)&regs.rax = 0;  /* No midnight yet. */
             *(unsigned short*)&regs.rcx = tick_count >> 16;
             *(unsigned short*)&regs.rdx = tick_count;
