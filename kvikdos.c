@@ -26,6 +26,7 @@
 
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
 #include <dirent.h>
+#include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>  /* For stdin availability check. */
@@ -451,6 +452,38 @@ static char *find_prog_on_path(const char *prog_filename, const DirState *dir_st
 static char dosfnbuf[DOS_PATH_SIZE];
 
 enum video_mode_t { VIDEO_VGA_COLOR = 0, VIDEO_EGA_MONO = 1 };
+
+/* Global pointer for video buffer dump on signal (SIGTERM/SIGINT). */
+static const unsigned char *g_dump_video_mem;
+static unsigned g_dump_video_size;
+
+static void dump_video_on_signal(int sig) {
+  if (g_dump_video_mem && g_dump_video_size) {
+    unsigned r, c;
+    char buf[32];
+    int n;
+    /* Show where the CPU was when killed. Read IVT-area hlt stub pointer is not useful,
+     * but we can show that video buffer was (not) rendered. */
+    (void)!write(2, "--- video buffer dump ---\n", 25);
+    for (r = 0; r < 25; ++r) {
+      for (c = 0; c < 80; ++c) {
+        unsigned ofs = (r * 80 + c) * 2;
+        char ch = (ofs < g_dump_video_size) ? (char)g_dump_video_mem[ofs] : ' ';
+        if (ch < 0x20) ch = ' ';
+        (void)!write(2, &ch, 1);
+      }
+      (void)!write(2, "\n", 1);
+    }
+    /* Count non-space chars in video buffer. */
+    n = 0;
+    for (c = 0; c < g_dump_video_size; c += 2) {
+      if (g_dump_video_mem[c] != ' ' && g_dump_video_mem[c] != 0) ++n;
+    }
+    n = sprintf(buf, "--- %d non-space chars ---\n", n);
+    (void)!write(2, buf, n);
+  }
+  _exit(128 + sig);
+}
 
 typedef struct EmuParams {
   char is_hlt_ok;
@@ -2480,6 +2513,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     video_base = 0xb8000; video_bios_mode = 3; video_crt_port = 0x3d4; video_status_port = 0x3da; video_is_color = 1;
   }
   { unsigned u; for (u = 0; u < sizeof(vga_mem); u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }  /* Clear video buffer: space + light gray on black. */
+  g_dump_video_mem = vga_mem;
+  g_dump_video_size = sizeof(vga_mem);
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
   cleanup_fn[0] = '\0';
@@ -5290,6 +5325,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: DPMI not supported: %s\n", cmd_args.dpmi_prog);
     exit(1);
   }
+  signal(SIGTERM, dump_video_on_signal);
+  signal(SIGINT, dump_video_on_signal);
   { int exit_code;
     const char *ext = get_linux_ext(cmd_args.prog_filename);
     EmuState emu;
