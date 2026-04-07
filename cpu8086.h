@@ -37,6 +37,6 @@
  */
 int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
                 struct kvm_run *run, void *mem, unsigned mem_size,
-                void *vga_mem, unsigned vga_mem_size);
+                void *video_mem, unsigned video_mem_size, unsigned video_base);
 
 #endif /* CPU8086_H */

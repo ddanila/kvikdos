@@ -450,11 +450,14 @@ static char *find_prog_on_path(const char *prog_filename, const DirState *dir_st
 #define DOS_PATH_SIZE 64  /* See int 0x21 ah == 0x47 (get current directory) */
 static char dosfnbuf[DOS_PATH_SIZE];
 
+enum video_mode_t { VIDEO_VGA_COLOR = 0, VIDEO_EGA_MONO = 1 };
+
 typedef struct EmuParams {
   char is_hlt_ok;
   unsigned mem_mb;
   const char *hlt_dump_filename;
   unsigned char dos_version;  /* Major DOS version reported via INT 21h/AH=30h and PSP+0x40. Default: 4. */
+  enum video_mode_t video_mode;
 } EmuParams;
 
 typedef struct ParsedCmdArgs {
@@ -525,6 +528,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   cmd_args.emu_params.is_hlt_ok = 0;
   cmd_args.emu_params.hlt_dump_filename = NULL;
   cmd_args.emu_params.dos_version = 5;  /* Default: 5 (kvikdos upstream default). Override with --dos-version=N. */
+  cmd_args.emu_params.video_mode = VIDEO_VGA_COLOR;
   is_kvm_check = 0;
   is_drive_specified = 0;
   while (argv[0]) {
@@ -540,6 +544,15 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
         exit(1);
       }
       cmd_args.emu_params.dos_version = (unsigned char)v;
+    } else if (0 == strncmp(arg, "--video-mode=", 13)) {
+      if (0 == strcmp(arg + 13, "vga_color")) {
+        cmd_args.emu_params.video_mode = VIDEO_VGA_COLOR;
+      } else if (0 == strcmp(arg + 13, "ega_mono")) {
+        cmd_args.emu_params.video_mode = VIDEO_EGA_MONO;
+      } else {
+        fprintf(stderr, "fatal: invalid --video-mode value (expected vga_color or ega_mono): %s\n", arg);
+        exit(1);
+      }
     } else if (0 == strcmp(arg, "--hlt-ok")) {
       cmd_args.emu_params.is_hlt_ok = 1;
     } else if (0 == strcmp(arg, "--env")) {
@@ -2423,7 +2436,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   char port_0x40_tick;
   unsigned char video_write_step;
   char video_byte_written;
-  unsigned char vga_mem[4000];  /* Text-mode video buffer at B800:0000. 80x25x2 = 4000 bytes (char+attr pairs). */
+  unsigned char vga_mem[4000];  /* Text-mode video buffer. 80x25x2 = 4000 bytes (char+attr pairs). */
+  unsigned video_base;  /* Linear address of video buffer: 0xB8000 (color) or 0xB0000 (mono). */
+  unsigned char video_bios_mode;  /* BIOS video mode: 3 (color 80x25) or 7 (mono 80x25). */
+  unsigned short video_crt_port;  /* CRT controller base port: 0x3D4 (color) or 0x3B4 (mono). */
+  unsigned short video_status_port;  /* Status register port: 0x3DA (color) or 0x3BA (mono). */
+  unsigned char video_is_color;  /* 1 for color, 0 for mono. */
   const char *stdout_write_p;
   const char *stdout_write_end;
   char is_stdout_write_cursor;
@@ -2456,6 +2474,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
   video_write_step = 0;
   video_byte_written = 0;  /* Pacify uninitialized warnings. */
+  if (emu_params->video_mode == VIDEO_EGA_MONO) {
+    video_base = 0xb0000; video_bios_mode = 7; video_crt_port = 0x3b4; video_status_port = 0x3ba; video_is_color = 0;
+  } else {
+    video_base = 0xb8000; video_bios_mode = 3; video_crt_port = 0x3d4; video_status_port = 0x3da; video_is_color = 1;
+  }
   { unsigned u; for (u = 0; u < sizeof(vga_mem); u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }  /* Clear video buffer: space + light gray on black. */
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
@@ -2639,7 +2662,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       exit(252);
     }
 #else /* !__linux__ */
-    if (cpu8086_run(&regs, &sregs, run, mem, DOS_MEM_LIMIT, vga_mem, sizeof(vga_mem)) < 0) {
+    if (cpu8086_run(&regs, &sregs, run, mem, DOS_MEM_LIMIT, vga_mem, sizeof(vga_mem), video_base) < 0) {
       fprintf(stderr, "fatal: cpu8086_run internal error\n");
       exit(252);
     }
@@ -2651,6 +2674,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       { char *p = (char*)run + run->io.data_offset;
         if (run->io.port == 0x40 && run->io.size == 1 && run->io.direction == 0) {
           *p = port_0x40_tick++;  /* Simulate some timer ticks. */
+          break;
+        } else if (run->io.port == video_status_port && run->io.size == 1 && run->io.direction == 0) {
+          /* VGA/EGA status register: toggle bit 0 (display enable) and bit 3 (vsync). */
+          port_0x40_tick ^= 0x09;  /* Reuse tick var; toggles bits 0 and 3. */
+          *p = port_0x40_tick & 0x09;
           break;
         } else {
           fprintf(stderr, "fatal: IO port: port=0x%02x data=%08x size=%d direction=%s\n", run->io.port, *(const unsigned*)p, run->io.size, run->io.direction ? "out" : "in");
@@ -4459,7 +4487,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             goto do_stdout_write_al;
           } else if (ah == 0x0f) {  /* Get video state. https://stanislavs.org/helppc/int_10-f.html */
             sphinx_cmm_flags |= 1;
-            *(unsigned short*)&regs.rax = 80 << 8 | 3;  /* 80x25. */
+            *(unsigned short*)&regs.rax = 80 << 8 | video_bios_mode;  /* AH=columns, AL=mode. */
             ((unsigned char*)&regs.rbx)[1] = 0;  /* BH := page (0). */
           } else if (ah == 0x08) {  /* Read character and attribute at cursor. */
             { const unsigned short cursor_pos = *(unsigned short*)((char*)mem + 0x450);
@@ -4529,24 +4557,24 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const unsigned char bl = (unsigned char)regs.rbx;
             if (bl == 0x10) {  /* Get video configuration information. */
               sphinx_cmm_flags |= 2;
-              *(unsigned short*)&regs.rbx = 1 << 8 | 0;  /* Mono, 64 KiB EGA memory. */
+              *(unsigned short*)&regs.rbx = (video_is_color ? 0 : 1) << 8 | 3;  /* BH=0: color or 1: mono. BL=3: 256 KiB EGA memory. */
               *(unsigned short*)&regs.rcx = 0;  /* Feature bits and switch settings. */
             } else {
               fprintf(stderr, "fatal: unsupported subcall for video subsystem configuration: 0x%02x\n", bl);
               goto fatal;
             }
-            *(unsigned short*)&regs.rax = 80 << 8 | 3;  /* 80x25. */
+            *(unsigned short*)&regs.rax = 80 << 8 | video_bios_mode;  /* AH=columns, AL=mode. */
             ((unsigned char*)&regs.rbx)[1] = 0;  /* BH := page (0). */
           } else if (ah == 0x00) {  /* Set video mode. */
-            /* AL = mode. We only support mode 3 (80x25 text). Just clear the video buffer. */
+            /* AL = mode. We support mode 3 (color 80x25) and mode 7 (mono 80x25). Just clear the video buffer. */
             { unsigned u; for (u = 0; u < sizeof(vga_mem); u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }
             *(unsigned short*)((char*)mem + 0x450) = 0;  /* Cursor pos page 0: row=0, col=0. */
-            *(unsigned char*)((char*)mem + 0x449) = 3;  /* BDA: current video mode = 3. */
+            *(unsigned char*)((char*)mem + 0x449) = video_bios_mode;  /* BDA: current video mode. */
             *(unsigned short*)((char*)mem + 0x44a) = 80;  /* BDA: columns per row. */
             *(unsigned short*)((char*)mem + 0x44c) = 4000;  /* BDA: video page size in bytes. */
             *(unsigned short*)((char*)mem + 0x44e) = 0;  /* BDA: active page offset. */
             *(unsigned char*)((char*)mem + 0x462) = 0;  /* BDA: active display page. */
-            *(unsigned short*)((char*)mem + 0x463) = 0x3d4;  /* BDA: CRT base port. */
+            *(unsigned short*)((char*)mem + 0x463) = video_crt_port;  /* BDA: CRT base port. */
             *(unsigned char*)((char*)mem + 0x484) = 24;  /* BDA: rows on screen minus 1. */
           } else if (ah == 0x06 || ah == 0x07) {  /* Scroll window up (06) / down (07). */
             const unsigned char lines = (unsigned char)regs.rax;
@@ -4598,6 +4626,15 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 if (r == 0) break;  /* Prevent unsigned wraparound. */
               }
             }
+          } else if (ah == 0x11) {  /* Character generator (font info). */
+            const unsigned char al = (unsigned char)regs.rax;
+            if (al == 0x30) {  /* Get font information. */
+              /* Return: CX = bytes per character, DL = rows - 1. */
+              *(unsigned short*)&regs.rcx = 16;  /* 16 bytes per character (8x16 font). */
+              *(unsigned char*)&regs.rdx = 24;  /* 25 rows - 1 = 24. */
+              /* ES:BP would point to font table, but we don't provide one. */
+            }
+            /* Other AL values (load font, etc.) are no-ops. */
           } else {
             goto fatal_int;
           }
@@ -4826,12 +4863,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else if (addr == 0xa003e && mmio_len == 2 && !run->mmio.is_write) {
           /* Microsoft Macro Assembler 6.00B driver masm.exe. */
           *(unsigned short*)run->mmio.data = 0;
-        } else if (addr >= 0xb8000 && addr + mmio_len <= 0xb8000 + sizeof(vga_mem)) {
-          /* CGA/text-mode video memory at B800:0000. */
+        } else if (addr >= video_base && addr + mmio_len <= video_base + sizeof(vga_mem)) {
+          /* Text-mode video memory (B800:0000 for color, B000:0000 for mono). */
           if (run->mmio.is_write) {
-            memcpy(vga_mem + (addr - 0xb8000), run->mmio.data, mmio_len);
+            memcpy(vga_mem + (addr - video_base), run->mmio.data, mmio_len);
           } else {
-            memcpy(run->mmio.data, vga_mem + (addr - 0xb8000), mmio_len);
+            memcpy(run->mmio.data, vga_mem + (addr - video_base), mmio_len);
           }
         } else if (addr >= 0xa0000 && addr < 0x110000 && !run->mmio.is_write) {
           /* High memory reads (DOS/BIOS ROM area): return 0 for all fields.
