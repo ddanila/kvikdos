@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 /* Include our adapted XTulator CPU types (CPU_t, macros, register indices). */
 #include "cpu8086_xt.h"
@@ -311,6 +312,7 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 	 * to check g_ctx.exit_pending after each instruction, so we can
 	 * call cpu_exec(cpu, 0xFFFFFFFF) instead of stepping one-by-one.
 	 */
+	{ unsigned insn_count = 0;
 	while (!g_ctx.exit_pending) {
 		if (g_coverage_enabled) {
 			unsigned addr = ((unsigned)cpu.segregs[regcs] << 4) + cpu.ip;
@@ -322,9 +324,20 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 			g_ctx.exit_pending = 1;
 			break;
 		}
-		/* Yield periodically so other threads (test harness) can run. */
-		if (g_coverage_enabled && (cpu.ip & 0x3F) == 0) {
-			sched_yield();
+		/* Update BDA timer periodically so programs that busy-wait on
+		 * 0040:006Ch (e.g. VC.COM's sync_to_timer for dialog animation)
+		 * don't hang.  Also yield to other threads. */
+		if ((++insn_count & 0xFFF) == 0) {
+			struct timeval tv;
+			gettimeofday(&tv, NULL);
+			{ const unsigned s = (unsigned)(tv.tv_sec % 86400);
+			  unsigned tick = s * 18U + s * 13318U / 65536U + (unsigned)tv.tv_usec * 18U / 1000000U;
+			  ((unsigned char *)mem)[0x46c] = (unsigned char)tick;
+			  ((unsigned char *)mem)[0x46d] = (unsigned char)(tick >> 8);
+			  ((unsigned char *)mem)[0x46e] = (unsigned char)(tick >> 16);
+			  ((unsigned char *)mem)[0x46f] = (unsigned char)(tick >> 24);
+			}
+			if (g_coverage_enabled) sched_yield();
 		}
 		cpu_exec(&cpu, 1);
 
@@ -334,7 +347,8 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 			cpu.hltstate = 0;
 			break;
 		}
-	}
+	} /* while !exit_pending */
+	} /* insn_count scope */
 
 	/* Sync XTulator CPU state back to kvikdos registers. */
 	regs_cpu_to_kvm(&cpu, regs, sregs);
