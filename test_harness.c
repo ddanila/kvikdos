@@ -41,9 +41,22 @@ static void *emu_thread_func(void *arg) {
   memset(&dir_state, 0, sizeof(dir_state));
   memset(&emu_params, 0, sizeof(emu_params));
 
-  /* Set up drive C:. */
+  /* Set up drive C:.
+   * Normalize mount dir to match kvikdos convention: empty string for
+   * current dir, or path with trailing '/'.  "." maps to "". */
   dir_state.drive = 'C';
-  dir_state.linux_mount_dir[2] = a->mount_dir[0] ? a->mount_dir : ".";
+  if (a->mount_dir[0] == '\0' ||
+      (a->mount_dir[0] == '.' && a->mount_dir[1] == '\0')) {
+    dir_state.linux_mount_dir[2] = "";
+  } else {
+    /* Ensure trailing '/'. mount_dir buffer is 1024 bytes. */
+    size_t len = strlen(a->mount_dir);
+    if (a->mount_dir[len - 1] != '/' && len + 1 < sizeof(a->mount_dir)) {
+      a->mount_dir[len] = '/';
+      a->mount_dir[len + 1] = '\0';
+    }
+    dir_state.linux_mount_dir[2] = a->mount_dir;
+  }
   dir_state.case_mode[2] = CASE_MODE_UPPERCASE;
 
   /* Emulator params. */
