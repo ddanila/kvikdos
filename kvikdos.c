@@ -3705,12 +3705,12 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                 MCB_TYPE(prev_mcb) = mcb_type;
                 mcb = prev_mcb;
               }
-              if (MCB_TYPE(mcb) == 'Z') {  /* Delete it as last free MCB. */
-                if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: delete last\n");
-                prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);
-                memcpy(mcb, freed_mcb, 16);
-                MCB_TYPE(prev_mcb) = 'Z';
-              }
+              /* Don't delete trailing free Z-blocks. Programs with is_azzy
+               * (like VC.COM) manage their own MCBs. Deleting the last free
+               * block changes the preceding block to Z-type, and if the
+               * program then modifies its MCBs, the chain can lose track of
+               * allocated blocks, causing subsequent allocations to overwrite
+               * live data. Keeping the trailing free block is harmless. */
             }
             if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free(0x%04x) OK\n", block_para);
             DEBUG_CHECK_ALL_MCBS(mem);
