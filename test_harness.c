@@ -253,3 +253,18 @@ int kviktest_coverage_report(const char *prog_path, unsigned code_bytes) {
 
   return pct;
 }
+
+int kviktest_coverage_dump(const char *path) {
+  const unsigned char *bmp = cpu8086_coverage_bitmap();
+  FILE *f;
+  if (!bmp) return -1;
+  f = fopen(path, "wb");
+  if (!f) {
+    fprintf(stderr, "Coverage: cannot write %s\n", path);
+    return -1;
+  }
+  fwrite(bmp, 1, 1 << 17, f);  /* 128 KB bitmap */
+  fclose(f);
+  printf("Coverage bitmap written to %s\n", path);
+  return 0;
+}

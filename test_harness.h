@@ -118,4 +118,12 @@ void kviktest_coverage_enable(void);
  */
 int kviktest_coverage_report(const char *prog_path, unsigned code_bytes);
 
+/*
+ * Dump the raw coverage bitmap to a file. The bitmap is 128 KB (1 bit per
+ * byte in the 1 MB address space). Use with tools/coverage_report.py to
+ * produce per-procedure coverage reports.
+ * Returns 0 on success, -1 on error.
+ */
+int kviktest_coverage_dump(const char *path);
+
 #endif /* TEST_HARNESS_H */
