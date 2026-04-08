@@ -1,5 +1,11 @@
 # Development guidelines for kvikdos
 
+## Workflow
+
+- All work happens on the `improvements` branch. No feature branches or PRs.
+- Commit directly to `improvements` and push to `origin/improvements`.
+- When used as a submodule (e.g. in beta_kappa), the parent repo records the submodule commit separately.
+
 ## KVM vs Software CPU
 
 - Backend selection uses `USE_KVM` define, not platform detection (`__linux__`).
