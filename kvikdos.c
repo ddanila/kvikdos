@@ -51,7 +51,7 @@
 #include <unistd.h>
 
 #include "mini_kvm.h"
-#ifndef __linux__
+#ifndef USE_KVM
 #include "cpu8086.h"
 #endif
 
@@ -2211,7 +2211,7 @@ KVIKDOS_STATIC void init_emu(struct EmuState *emu) {
 static void reset_emu(struct EmuState *emu) {
   void *mem;
   if (emu->kvm_fds.kvm_fd < 0) {
-#ifdef __linux__
+#ifdef USE_KVM
     int kvm_fd, vm_fd, vcpu_fd;
     int kvm_run_mmap_size, api_version;
     struct kvm_userspace_memory_region region;
@@ -2232,7 +2232,7 @@ static void reset_emu(struct EmuState *emu) {
       perror("fatal: failed to create KVM vm");
       exit(252);
     }
-#endif /* __linux__ */
+#endif /* USE_KVM */
     /* If emu_params->mem_mb > 1, then we have allocate more. */
     if ((emu->mem = mem = mmap(NULL, DOS_MEM_LIMIT, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
@@ -2241,7 +2241,7 @@ static void reset_emu(struct EmuState *emu) {
       exit(252);
     }
 
-#ifdef __linux__
+#ifdef USE_KVM
     memset(&region, 0, sizeof(region));
     region.slot = 0;
     region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the Linux page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
@@ -2287,7 +2287,7 @@ static void reset_emu(struct EmuState *emu) {
       exit(252);
     }
     emu->kvm_fds.kvm_fd = kvm_fd; emu->kvm_fds.vm_fd = vm_fd; emu->kvm_fds.vcpu_fd = vcpu_fd;
-#else /* !__linux__ */
+#else /* !USE_KVM */
     {
       static struct kvm_run static_kvm_run;
       emu->kvm_run = &static_kvm_run;
@@ -2296,7 +2296,7 @@ static void reset_emu(struct EmuState *emu) {
     emu->kvm_fds.kvm_fd = 0;  /* Mark as initialized (not -1). */
     emu->kvm_fds.vm_fd = -1;
     emu->kvm_fds.vcpu_fd = -1;
-#endif /* __linux__ */
+#endif /* USE_KVM */
   } else {
     mem = emu->mem;
 #ifdef __linux__
@@ -2690,7 +2690,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
   /* !! Security: close all filehandles except for 0, 1, 2 and kvm_fds, so that read and write from DOS won't be able to touch them. */
 
  set_sregs_regs_and_continue:
-#ifdef __linux__
+#ifdef USE_KVM
   if (ioctl(kvm_fds.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
     perror("fatal: KVM_SET_SREGS");
     exit(252);
@@ -2699,11 +2699,11 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
     perror("fatal: KVM_SET_REGS\n");
     exit(252);
   }
-#endif /* __linux__ */
+#endif /* USE_KVM */
 
   /* !! Trap it if it tries to enter protected mode (cr0 |= 1). Is this possible? */
   for (;;) {
-#ifdef __linux__
+#ifdef USE_KVM
     int ret = ioctl(kvm_fds.vcpu_fd, KVM_RUN, 0);
     if (ret < 0) {
       fprintf(stderr, "KVM_RUN failed");
@@ -2717,12 +2717,12 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
       perror("fatal: KVM_GET_REGS");
       exit(252);
     }
-#else /* !__linux__ */
+#else /* !USE_KVM */
     if (cpu8086_run(&regs, &sregs, run, mem, DOS_MEM_LIMIT, vga_mem, sizeof(vga_mem), video_base) < 0) {
       fprintf(stderr, "fatal: cpu8086_run internal error\n");
       exit(252);
     }
-#endif /* __linux__ */
+#endif /* USE_KVM */
     if (DEBUG) dump_regs("debug", &regs, &sregs);
 
     /* Update BDA timer (0040:006C) from wall clock on each VM exit. */
@@ -2751,13 +2751,13 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
         }
       }
      case KVM_EXIT_SHUTDOWN:  /* How do we trigger it? */
-#ifndef __linux__
+#ifndef USE_KVM
       if (g_cpu8086_abort) return 0;  /* Test harness requested shutdown. */
 #endif
       fprintf(stderr, "fatal: shutdown\n");
       exit(252);
      case KVM_EXIT_HLT:
-#ifndef __linux__
+#ifndef USE_KVM
       if (g_cpu8086_abort) return 0;  /* Test harness requested shutdown. */
 #endif
       if (sregs.cs.selector == INT_HLT_PARA && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */

@@ -35,18 +35,30 @@ a20wrap.com: a20wrap.nasm
 %.com: %.nasm
 	nasm -O0 -f bin -o $@ $<
 
-ifeq ($(shell uname -s),Linux)
-kvikdos: $(SRCDEPS)
-	gcc $(CFLAGS) -o $@ $<
-else
 # cpu8086.c is adapted from XTulator (C99 code), so it needs relaxed flags.
 CPU8086_CFLAGS = -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -fno-strict-aliasing $(XCFLAGS)
+
+ifeq ($(shell uname -s),Linux)
+# Default Linux build: KVM backend.
+kvikdos: $(SRCDEPS)
+	gcc $(CFLAGS) -DUSE_KVM -o $@ $<
+
+# Soft CPU build on Linux (for testing without KVM).
+kvikdos-soft: $(SRCDEPS) $(CPU8086_DEPS)
+	$(CC) $(CFLAGS) -c -o kvikdos.o kvikdos.c
+	$(CC) $(CPU8086_CFLAGS) -c -o cpu8086.o cpu8086.c
+	$(CC) -s -o $@ kvikdos.o cpu8086.o
+	@rm -f kvikdos.o cpu8086.o
+else
+# Non-Linux (macOS): always use software CPU (no KVM available).
 kvikdos: $(SRCDEPS) $(CPU8086_DEPS)
 	$(CC) $(CFLAGS) -c -o kvikdos.o kvikdos.c
 	$(CC) $(CPU8086_CFLAGS) -c -o cpu8086.o cpu8086.c
 	$(CC) -s -o $@ kvikdos.o cpu8086.o
 	@rm -f kvikdos.o cpu8086.o
-	@cp -f $@ kvikdos-soft
+
+kvikdos-soft: kvikdos
+	@cp -f $< $@
 endif
 
 # Test harness library: test_harness.c #includes kvikdos.c with KVIKDOS_TEST.
@@ -59,13 +71,13 @@ cpu8086_test.o: $(CPU8086_DEPS)
 	$(CC) $(CPU8086_CFLAGS) -c -o cpu8086_test.o cpu8086.c
 
 kvikdos32: $(SRCDEPS)
-	gcc -m32 -fno-pic -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
+	gcc -m32 -fno-pic -march=i686 -mtune=generic $(CFLAGS) -DUSE_KVM -o $@ $<
 
 kvikdos64: $(SRCDEPS)
-	gcc -m64 -march=k8 -mtune=generic $(CFLAGS) -o $@ $<
+	gcc -m64 -march=k8 -mtune=generic $(CFLAGS) -DUSE_KVM -o $@ $<
 
 kvikdos.static: $(SRCDEPS)
-	xstatic gcc -m32 -fno-pic -D_FILE_OFFSET_BITS=64 -DUSE_MINI_KVM -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
+	xstatic gcc -m32 -fno-pic -D_FILE_OFFSET_BITS=64 -DUSE_MINI_KVM -DUSE_KVM -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
 
 kvikdos.diet: $(SRCDEPS)
-	minicc --gcc=4.8 --diet -DUSE_MINI_KVM -fno-strict-aliasing -o kvikdos.diet kvikdos.c
+	minicc --gcc=4.8 --diet -DUSE_MINI_KVM -DUSE_KVM -fno-strict-aliasing -o kvikdos.diet kvikdos.c
