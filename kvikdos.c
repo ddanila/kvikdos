@@ -45,6 +45,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/xattr.h>
 #include <termios.h>
@@ -3354,6 +3355,28 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
               (*(unsigned short*)&regs.rbx) = pp[0];
               SET_SREG(es, pp[1]);
+            }
+          } else if (ah == 0x36) {  /* Get disk free space. DL: drive (0=default, 1=A, 2=B, 3=C...). */
+            { const unsigned char dl36 = *(unsigned char*)&regs.rdx;
+              const char drive_idx36 = dl36 == 0 ? dir_state->drive - 'A' : dl36 - 1;
+              if ((unsigned char)drive_idx36 >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drive_idx36]) {
+                *(unsigned short*)&regs.rax = 0xffff;  /* AX=FFFFh: invalid drive. */
+              } else {
+                struct statvfs svfs;
+                const char *mount = dir_state->linux_mount_dir[(int)drive_idx36];
+                if (mount[0] == '\0') mount = ".";
+                if (statvfs(mount, &svfs) == 0) {
+                  const unsigned long total_kb = (unsigned long)(svfs.f_blocks / 1024) * svfs.f_frsize;
+                  const unsigned long free_kb = (unsigned long)(svfs.f_bavail / 1024) * svfs.f_frsize;
+                  /* Report as: 8 sectors/cluster, 512 bytes/sector = 4096 bytes/cluster. */
+                  *(unsigned short*)&regs.rax = 8;      /* AX: sectors per cluster. */
+                  *(unsigned short*)&regs.rcx = 512;    /* CX: bytes per sector. */
+                  *(unsigned short*)&regs.rdx = (unsigned short)(total_kb > 0xffff ? 0xffff : total_kb);  /* DX: total clusters. */
+                  *(unsigned short*)&regs.rbx = (unsigned short)(free_kb > 0xffff ? 0xffff : free_kb);    /* BX: available clusters. */
+                } else {
+                  *(unsigned short*)&regs.rax = 0xffff;  /* Error. */
+                }
+              }
             }
           } else if (ah == 0x0b) {  /* Check input status. */
             *(unsigned char*)&regs.rax = 0;  /* No input ready. 0xff would be input. */
