@@ -21,12 +21,19 @@ run: kvikdos guest.com
 	./kvikdos guest.com hello world
 
 test: kvikdos guest.com cat.com printenv.com malloct.com a20wrap.com vidtest.com
+	@echo "--- strict mode (default) ---"
 	@echo "=== guest.com ===" && ./kvikdos guest.com hello world | grep -q "Hello, World" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== cat.com ===" && echo "test123" | ./kvikdos cat.com | grep -q "test123" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== printenv.com ===" && ./kvikdos printenv.com | grep -q "PATH=" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== malloct.com ===" && ./kvikdos malloct.com | grep -q "malloct OK" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== a20wrap.com ===" && ./kvikdos a20wrap.com | grep -q "A20 wrap OK" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== vidtest.com ===" && ./kvikdos vidtest.com | grep -q "vidtest OK" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "--- azzy mode (--azzy) ---"
+	@echo "=== guest.com --azzy ===" && ./kvikdos --azzy guest.com hello world | grep -q "Hello, World" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== cat.com --azzy ===" && echo "test123" | ./kvikdos --azzy cat.com | grep -q "test123" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== malloct.com --azzy ===" && ./kvikdos --azzy malloct.com | grep -q "malloct OK" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== a20wrap.com --azzy ===" && ./kvikdos --azzy a20wrap.com | grep -q "A20 wrap OK" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== vidtest.com --azzy ===" && ./kvikdos --azzy vidtest.com | grep -q "vidtest OK" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "All tests passed."
 
 a20wrap.com: a20wrap.nasm

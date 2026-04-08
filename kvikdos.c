@@ -78,6 +78,10 @@
 #define CMD_PARSE_DEBUG DEBUG
 #define CMD_PARSE_MEM_MB_1 1
 
+/* Global flag: if true, relax MCB validation and filename checks for programs
+ * that manage their own MCBs and use dot-prefixed filenames. Set via --azzy. */
+static char g_azzy;
+
 /* --- Command-line (argv) parser. Can be used separately from kvikdos. */
 
 #include <stdio.h>  /* fprintf(). */
@@ -322,8 +326,7 @@ static char *get_linux_filename_r(const char *p, const DirState *dir_state, char
           dot_count = LINUX_PATH_SIZE + 2;
         } else {
           ++component_count;
-          /* Allow filenames like .CL1, .CTL etc. (DOS extension-only names). */
-          /* if (*p == '.') goto error; */
+          if (!g_azzy && *p == '.') goto error;  /* First character in component is '.'. Allowed with --azzy for names like .CL1, .CTL. */
         }
         for (; *p != '\0';) {
           const char c = *p;
@@ -351,7 +354,7 @@ static char *get_linux_filename_r(const char *p, const DirState *dir_state, char
         for (; *p == '\\' || *p == '/'; ++p) {}
       }
     }
-    /* Don't reject trailing slash — it's valid for directory paths (e.g. C:\, SUBDIR\). */
+    if (!g_azzy && (p[-1] == '/' || p[-1] == '\\')) goto error;  /* Pathname ends with a slash. Allowed with --azzy for directory paths. */
   }
  done:
   *out_p = '\0';
@@ -527,6 +530,7 @@ typedef struct EmuParams {
   const char *hlt_dump_filename;
   unsigned char dos_version;  /* Major DOS version reported via INT 21h/AH=30h and PSP+0x40. Default: 4. */
   enum video_mode_t video_mode;
+  char is_azzy;  /* If true, relax MCB validation and filename checks for programs that manage their own MCBs and use dot-prefixed filenames. */
 } EmuParams;
 
 typedef struct ParsedCmdArgs {
@@ -598,6 +602,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   cmd_args.emu_params.hlt_dump_filename = NULL;
   cmd_args.emu_params.dos_version = 5;  /* Default: 5 (kvikdos upstream default). Override with --dos-version=N. */
   cmd_args.emu_params.video_mode = VIDEO_VGA_COLOR;
+  cmd_args.emu_params.is_azzy = 0;
   is_kvm_check = 0;
   is_drive_specified = 0;
   while (argv[0]) {
@@ -624,6 +629,8 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       }
     } else if (0 == strcmp(arg, "--hlt-ok")) {
       cmd_args.emu_params.is_hlt_ok = 1;
+    } else if (0 == strcmp(arg, "--azzy")) {
+      cmd_args.emu_params.is_azzy = 1;
     } else if (0 == strcmp(arg, "--env")) {
       if (!argv[0]) { missing_argument:
         fprintf(stderr, "fatal: missing argument for flag: %s\n", arg);
@@ -1159,24 +1166,40 @@ static char is_mcb_bad(void *mem, unsigned short block_para) {
   unsigned short size_para;
   if (block_para < PSP_PARA) return 1;  /* MCB too low in memory. qblink.exe calls with block_para==0 many times, but it's still bad. */
   if (block_para >= DOS_ALLOC_PARA_LIMIT) return 2;  /* MCB too high in memory. */
-  /* Don't check signature bytes 7-15: programs (e.g. VC.COM) create their own MCBs with standard DOS program names. */
+  if (!g_azzy) {
+    if (memcmp(mcb + 7, default_program_mcb + 7, 9) != 0) return 3;  /* MCB has bad signature. */
+  }
   if (MCB_TYPE(mcb) == 'Z') {
-    /* Last MCB may be free (e.g. after shrinking the last allocated block). */
+    /* Note: last MCB being free (PID==0) is valid — e.g. after shrinking the last block. */
   } else if (MCB_TYPE(mcb) != 'M') {
     return 5;  /* Bad MCB type. */
   }
-  /* Don't check PID strictly: programs may use their own PSP segment as the MCB owner. */
+  if (!g_azzy) {
+    if (MCB_PID(mcb) != 0 && MCB_PID(mcb) != PROCESS_ID) return 6;  /* Bad MCB process ID. */
+  }
   size_para = MCB_SIZE_PARA(mcb);
   if (MCB_TYPE(mcb) == 'Z') {
     if (block_para + size_para > DOS_ALLOC_PARA_LIMIT) return 7;  /* Final MCB too long. */
   } else {
+    const char * const next_mcb = mcb + 16 + (size_para << 4);
     if (block_para + size_para >= DOS_ALLOC_PARA_LIMIT) return 8;  /* Non-final MCB too long. */
+    if (!g_azzy) {
+      if (MCB_PSIZE_PARA(next_mcb) != size_para) return 9;  /* MCB size and next psize mismatch. */
+      if (MCB_PID(mcb) == 0 && MCB_PID(next_mcb) == 0) return 10;  /* found adjacent free MCBs in next. */
+    }
   }
   if (block_para == PSP_PARA) {
+    if (!g_azzy) {
+      if (MCB_PSIZE_PARA(mcb) != 0) return 11;  /* Nonzero PSP MCB psize. */
+    }
     if (MCB_PID(mcb) == 0) return 12;  /* PSP MCB is free. */
+  } else if (!g_azzy) {
+    const char * const prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);
+    if (block_para < PSP_PARA + 1 + MCB_PSIZE_PARA(prev_mcb)) return 13;  /* MCB psize too large. */
+    if (MCB_TYPE(prev_mcb) != 'M') return 14;  /* Bad prev MCB type. */
+    if (MCB_SIZE_PARA(prev_mcb) != MCB_PSIZE_PARA(mcb)) return 15;  /* MCB prev size and psize mismatch. */
+    if (MCB_PID(mcb) == 0 && MCB_PID(prev_mcb) == 0) return 16;  /* Found adjacent free MCBs in prev. */
   }
-  /* Note: psize checks (9, 11, 13-16) removed because programs like VC.COM
-   * create their own MCBs that don't have the kvikdos-specific psize field. */
   return 0;  /* MCB looks good. */
 }
 
@@ -2531,6 +2554,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
   cleanup_fn[0] = '\0';
+  g_azzy = emu_params->is_azzy;
 
  do_exec:
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);

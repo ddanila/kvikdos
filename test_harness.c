@@ -50,6 +50,7 @@ static void *emu_thread_func(void *arg) {
   emu_params.mem_mb = 1;
   emu_params.dos_version = 5;
   emu_params.video_mode = VIDEO_VGA_COLOR;
+  emu_params.is_azzy = 1;  /* Test harness uses relaxed validation (programs like VC.COM manage their own MCBs). */
 
   /* Use test key mode (ring buffer). */
   init_tty_state(&tty_state, -3);
