@@ -3806,7 +3806,8 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
             if (DEBUG) fprintf(stderr, "debug: findfirst pattern=(%s) attrs=0x%04x\n", pattern, attrs);
             if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
-            if (attrs & 8) {  /* Volume label requested. */
+            { const unsigned short search_attrs = attrs & (unsigned short)~8u;  /* Strip volume label bit; kvikdos has no volume labels. */
+            if (!search_attrs && (attrs & 8)) {  /* Pure volume label request (no other attribute bits). */
              no_more_files:
               *(unsigned short*)&regs.rax = 0x12;  /* No more files. */
               goto error_on_21;
@@ -3870,7 +3871,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               ws = &wildcard_searches[slot];
               ws->dir = dirp;
               memcpy(ws->pattern, upat, strlen(upat) + 1);
-              ws->attrs = attrs;
+              ws->attrs = search_attrs;
               memcpy(ws->dir_linux, dir_linux, strlen(dir_linux) + 1);
               ws->id = wildcard_search_next_id++;
               if (wildcard_search_next_id == 0) wildcard_search_next_id = 1;
@@ -3936,6 +3937,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             }
             *(unsigned short*)&regs.rax = 0;  /* Undocumented, but necessary and used as a success indicator by the VAL 1995-05-27 linker val.exe. DOSBox also sets it. */
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            }  /* search_attrs */
           } else if (ah == 0x4f) {  /* Find next matching file (findnext). */
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
             if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;

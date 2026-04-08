@@ -2,7 +2,7 @@
 .SUFFIXES:
 MAKEFLAGS += -r
 
-ALL = kvikdos guest.com slowp.com malloct.com mallocs.com printenv.com cat.com waitkey.com a20wrap.com vidtest.com
+ALL = kvikdos guest.com slowp.com malloct.com mallocs.com printenv.com cat.com waitkey.com a20wrap.com vidtest.com findfirst.com
 
 # -Werror=int-conversion: GCC 4.8.4 fails.
 CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -fno-strict-aliasing -Wno-overlength-strings $(XCFLAGS)
@@ -20,7 +20,7 @@ clean:
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
 
-test: kvikdos guest.com cat.com printenv.com malloct.com a20wrap.com vidtest.com
+test: kvikdos guest.com cat.com printenv.com malloct.com a20wrap.com vidtest.com findfirst.com
 	@echo "--- strict mode (default) ---"
 	@echo "=== guest.com ===" && ./kvikdos guest.com hello world | grep -q "Hello, World" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== cat.com ===" && echo "test123" | ./kvikdos cat.com | grep -q "test123" && echo "PASS" || { echo "FAIL"; exit 1; }
@@ -28,12 +28,14 @@ test: kvikdos guest.com cat.com printenv.com malloct.com a20wrap.com vidtest.com
 	@echo "=== malloct.com ===" && ./kvikdos malloct.com | grep -q "malloct OK" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== a20wrap.com ===" && ./kvikdos a20wrap.com | grep -q "A20 wrap OK" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== vidtest.com ===" && ./kvikdos vidtest.com | grep -q "vidtest OK" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== findfirst.com ===" && ./kvikdos findfirst.com | grep -q "findfirst OK" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "--- azzy mode (--azzy) ---"
 	@echo "=== guest.com --azzy ===" && ./kvikdos --azzy guest.com hello world | grep -q "Hello, World" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== cat.com --azzy ===" && echo "test123" | ./kvikdos --azzy cat.com | grep -q "test123" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== malloct.com --azzy ===" && ./kvikdos --azzy malloct.com | grep -q "malloct OK" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== a20wrap.com --azzy ===" && ./kvikdos --azzy a20wrap.com | grep -q "A20 wrap OK" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "=== vidtest.com --azzy ===" && ./kvikdos --azzy vidtest.com | grep -q "vidtest OK" && echo "PASS" || { echo "FAIL"; exit 1; }
+	@echo "=== findfirst.com --azzy ===" && ./kvikdos --azzy findfirst.com | grep -q "findfirst OK" && echo "PASS" || { echo "FAIL"; exit 1; }
 	@echo "All tests passed."
 
 a20wrap.com: a20wrap.nasm

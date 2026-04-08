@@ -43,7 +43,7 @@ static void *emu_thread_func(void *arg) {
 
   /* Set up drive C:. */
   dir_state.drive = 'C';
-  dir_state.linux_mount_dir[2] = a->mount_dir[0] ? a->mount_dir : "";
+  dir_state.linux_mount_dir[2] = a->mount_dir[0] ? a->mount_dir : ".";
   dir_state.case_mode[2] = CASE_MODE_UPPERCASE;
 
   /* Emulator params. */
