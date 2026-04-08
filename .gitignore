@@ -3,6 +3,7 @@
 *.com
 *.exe
 /kvikdos
+/kvikdos-soft
 /kvikdos32
 /kvikdos64
 /kvikdos.static
