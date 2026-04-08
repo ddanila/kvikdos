@@ -111,9 +111,11 @@ void kviktest_coverage_enable(void);
 
 /*
  * Print coverage report for the loaded program.
- * prog_path: path to the .COM/.EXE file (used to determine code size).
+ * prog_path: path to the .COM/.EXE file (used to determine total size).
+ * code_bytes: if nonzero, use this as the denominator instead of file size
+ *             (for programs with large data sections like VC.COM).
  * Returns coverage percentage (0-100).
  */
-int kviktest_coverage_report(const char *prog_path);
+int kviktest_coverage_report(const char *prog_path, unsigned code_bytes);
 
 #endif /* TEST_HARNESS_H */

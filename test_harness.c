@@ -217,10 +217,10 @@ void kviktest_coverage_enable(void) {
   cpu8086_coverage_enable();
 }
 
-int kviktest_coverage_report(const char *prog_path) {
+int kviktest_coverage_report(const char *prog_path, unsigned code_bytes) {
   /* COM programs load at PSP_PARA:0100 = linear 0x1100. */
   const unsigned code_start = 0x1100;
-  unsigned code_size = 0;
+  unsigned file_size = 0;
   unsigned hit;
   int pct;
 
@@ -228,22 +228,23 @@ int kviktest_coverage_report(const char *prog_path) {
   { FILE *f = fopen(prog_path, "rb");
     if (f) {
       fseek(f, 0, SEEK_END);
-      code_size = (unsigned)ftell(f);
+      file_size = (unsigned)ftell(f);
       fclose(f);
     }
   }
-  if (code_size == 0) {
+  if (file_size == 0) {
     printf("Coverage: cannot determine program size for %s\n", prog_path);
     return 0;
   }
 
   cpu8086_coverage_disable();
-  hit = cpu8086_coverage_count(code_start, code_size);
-  pct = (int)((unsigned long)hit * 100 / code_size);
+  hit = cpu8086_coverage_count(code_start, file_size);
+  if (code_bytes == 0) code_bytes = file_size;
+  pct = (int)((unsigned long)hit * 100 / code_bytes);
 
-  printf("\n=== Coverage: %u / %u bytes hit = %d%% ===\n", hit, code_size, pct);
-  printf("  Program: %s (%u bytes)\n", prog_path, code_size);
-  printf("  Code range: 0x%05X - 0x%05X\n", code_start, code_start + code_size - 1);
+  printf("\n=== Coverage: %u / %u code bytes hit = %d%% ===\n", hit, code_bytes, pct);
+  printf("  Program: %s (%u bytes, %u code)\n", prog_path, file_size, code_bytes);
+  printf("  Code range: 0x%05X - 0x%05X\n", code_start, code_start + file_size - 1);
 
   /* Also report total unique addresses hit across full 1MB. */
   { unsigned total = cpu8086_coverage_count(0, 0x100000);
