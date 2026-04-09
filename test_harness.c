@@ -254,6 +254,16 @@ int kviktest_coverage_report(const char *prog_path, unsigned code_bytes) {
   return pct;
 }
 
+void kviktest_inject_dos_error(unsigned char ah, unsigned short error_code, int after_n) {
+  g_test_dos_inject.countdown = after_n;
+  g_test_dos_inject.error_code = error_code;
+  g_test_dos_inject.ah = ah;  /* Set ah last — it's the enable flag. */
+}
+
+void kviktest_clear_dos_error(void) {
+  g_test_dos_inject.ah = 0;
+}
+
 int kviktest_coverage_dump(const char *path) {
   const unsigned char *bmp = cpu8086_coverage_bitmap();
   FILE *f;

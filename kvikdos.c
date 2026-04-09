@@ -27,6 +27,15 @@
 /* When building for the test harness, export certain symbols. */
 #ifdef KVIKDOS_TEST
 #define KVIKDOS_STATIC /* non-static */
+/* Error injection for testing: when test_inject_ah != 0, the next matching
+ * INT 21h call (after test_inject_countdown reaches 0) returns the specified
+ * DOS error code instead of performing the operation. */
+struct test_dos_error_inject {
+  unsigned char ah;          /* DOS function to intercept (0x40=write, 0x41=delete, etc.), 0=disabled */
+  unsigned short error_code; /* DOS error code to return */
+  int countdown;             /* decrement on each matching call; inject when reaches 0 */
+};
+volatile struct test_dos_error_inject g_test_dos_inject = {0, 0, 0};
 #else
 #define KVIKDOS_STATIC static
 #endif
@@ -2931,6 +2940,16 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                   *(unsigned short*)&regs.rax = 0x1d;  /* Write fault. */
                   goto error_on_21;
                 }
+#ifdef KVIKDOS_TEST
+                if (g_test_dos_inject.ah == 0x40 && got > 0) {
+                  if (g_test_dos_inject.countdown <= 0) {
+                    g_test_dos_inject.ah = 0;  /* One-shot: disable after triggering. */
+                    *(unsigned short*)&regs.rax = g_test_dos_inject.error_code;
+                    goto error_on_21;
+                  }
+                  --g_test_dos_inject.countdown;
+                }
+#endif
               }
              write_success:
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
@@ -3027,6 +3046,16 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x3d || ah == 0x3c || ah == 0x5b) {  /* Open to handle. Create to handle. Create new (fail if exists). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+#ifdef KVIKDOS_TEST
+            if (g_test_dos_inject.ah == ah) {
+              if (g_test_dos_inject.countdown <= 0) {
+                g_test_dos_inject.ah = 0;  /* One-shot. */
+                *(unsigned short*)&regs.rax = g_test_dos_inject.error_code;
+                goto error_on_21;
+              }
+              --g_test_dos_inject.countdown;
+            }
+#endif
             const int flags = (ah == 0x3c) ? O_RDWR | O_CREAT | O_TRUNC :
                 (ah == 0x5b) ? O_RDWR | O_CREAT | O_EXCL :
                 *(unsigned char*)&regs.rax & 3;  /* O_RDONLY == 0, O_WRONLY == 1, O_RDWR == 2 same in DOS and Linux. */
@@ -3323,6 +3352,16 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             }
           } else if (ah == 0x41) {  /* Delete file. */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+#ifdef KVIKDOS_TEST
+            if (g_test_dos_inject.ah == 0x41) {
+              if (g_test_dos_inject.countdown <= 0) {
+                g_test_dos_inject.ah = 0;  /* One-shot. */
+                *(unsigned short*)&regs.rax = g_test_dos_inject.error_code;
+                goto error_on_21;
+              }
+              --g_test_dos_inject.countdown;
+            }
+#endif
             const int fd = unlink(get_linux_filename(p));
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
