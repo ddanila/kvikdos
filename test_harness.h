@@ -128,8 +128,8 @@ int kviktest_coverage_dump(const char *path);
 
 /*
  * Inject a DOS error on a future INT 21h call.
- * ah:         DOS function to intercept (0x3c=create, 0x3d=open, 0x40=write,
- *             0x41=delete). Set to 0 to disable.
+ * ah:         DOS function to intercept (0x3c=create, 0x3d=open, 0x3f=read,
+ *             0x40=write, 0x41=delete). Set to 0 to disable.
  * error_code: DOS error to return (5=access denied, 0x1d=write fault,
  *             0x27=insufficient disk space, etc.)
  * after_n:    skip this many matching calls before injecting (0 = next call).

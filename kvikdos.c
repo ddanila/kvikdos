@@ -2962,7 +2962,18 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             } else {
               char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
               const int size = (int)*(unsigned short*)&regs.rcx;
-              const int got = read(fd, p, size);
+              int got;
+#ifdef KVIKDOS_TEST
+              if (g_test_dos_inject.ah == 0x3f) {
+                if (g_test_dos_inject.countdown <= 0) {
+                  g_test_dos_inject.ah = 0;  /* One-shot. */
+                  *(unsigned short*)&regs.rax = g_test_dos_inject.error_code;
+                  goto error_on_21;
+                }
+                --g_test_dos_inject.countdown;
+              }
+#endif
+              got = read(fd, p, size);
               if (got < 0) {
                 *(unsigned short*)&regs.rax = 0x1e;  /* Read fault. */
                 goto error_on_21;
