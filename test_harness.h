@@ -132,6 +132,8 @@ int kviktest_coverage_dump(const char *path);
  *             0x40=write, 0x41=delete). Set to 0 to disable.
  * error_code: DOS error to return (5=access denied, 0x1d=write fault,
  *             0x27=insufficient disk space, etc.)
+ *             Special: error_code=0 with ah=0x40 simulates a short write
+ *             (0 bytes written, no error flag) which triggers disk full.
  * after_n:    skip this many matching calls before injecting (0 = next call).
  * One-shot: automatically disables after triggering once.
  */

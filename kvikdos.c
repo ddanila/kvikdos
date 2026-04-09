@@ -2944,10 +2944,15 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                 if (g_test_dos_inject.ah == 0x40 && got > 0) {
                   if (g_test_dos_inject.countdown <= 0) {
                     g_test_dos_inject.ah = 0;  /* One-shot: disable after triggering. */
-                    *(unsigned short*)&regs.rax = g_test_dos_inject.error_code;
-                    goto error_on_21;
+                    if (g_test_dos_inject.error_code == 0) {
+                      got = 0;  /* Short write: 0 bytes, no error (triggers disk full path). */
+                    } else {
+                      *(unsigned short*)&regs.rax = g_test_dos_inject.error_code;
+                      goto error_on_21;
+                    }
+                  } else {
+                    --g_test_dos_inject.countdown;
                   }
-                  --g_test_dos_inject.countdown;
                 }
 #endif
               }
