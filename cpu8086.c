@@ -314,10 +314,13 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 	 */
 	{ unsigned insn_count = 0;
 	while (!g_ctx.exit_pending) {
+		unsigned cov_ip_before = 0, cov_seg_base = 0;
 		if (g_coverage_enabled) {
-			unsigned addr = ((unsigned)cpu.segregs[regcs] << 4) + cpu.ip;
-			addr &= 0xFFFFF;
-			g_coverage_bitmap[addr >> 3] |= (1 << (addr & 7));
+			cov_seg_base = (unsigned)cpu.segregs[regcs] << 4;
+			cov_ip_before = cpu.ip;
+			{ unsigned addr = (cov_seg_base + cov_ip_before) & 0xFFFFF;
+			  g_coverage_bitmap[addr >> 3] |= (1 << (addr & 7));
+			}
 		}
 		if (g_cpu8086_abort) {
 			run->exit_reason = KVM_EXIT_SHUTDOWN;
@@ -340,6 +343,20 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 			if (g_coverage_enabled) sched_yield();
 		}
 		cpu_exec(&cpu, 1);
+		/* Mark ALL bytes of the executed instruction in the coverage bitmap.
+		 * After cpu_exec, cpu.ip points to the next instruction. For
+		 * sequential execution (no jump), ip_after - ip_before = insn length.
+		 * For jumps/calls the delta is large or negative; skip in that case. */
+		if (g_coverage_enabled) {
+			unsigned delta = cpu.ip - cov_ip_before;
+			if (delta >= 2 && delta <= 15) {
+				unsigned i;
+				for (i = 1; i < delta; ++i) {
+					unsigned addr = (cov_seg_base + cov_ip_before + i) & 0xFFFFF;
+					g_coverage_bitmap[addr >> 3] |= (1 << (addr & 7));
+				}
+			}
+		}
 
 		/* HLT sets hltstate=1; translate to KVM_EXIT_HLT. */
 		if (cpu.hltstate) {
