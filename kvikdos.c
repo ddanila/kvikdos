@@ -2515,7 +2515,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
   char port_0x40_tick;
   unsigned char video_write_step;
   char video_byte_written;
-  unsigned char vga_mem[4000];  /* Text-mode video buffer. 80x25x2 = 4000 bytes (char+attr pairs). */
+  static unsigned char vga_mem[32768];  /* Text-mode video buffer. Real VGA has 32KB (8 pages of 80x25x2). Only first 4000 bytes (page 0) are visible. Static to avoid stack overflow in test threads. */
   unsigned video_base;  /* Linear address of video buffer: 0xB8000 (color) or 0xB0000 (mono). */
   unsigned char video_bios_mode;  /* BIOS video mode: 3 (color 80x25) or 7 (mono 80x25). */
   unsigned short video_crt_port;  /* CRT controller base port: 0x3D4 (color) or 0x3B4 (mono). */
@@ -2558,9 +2558,10 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
   } else {
     video_base = 0xb8000; video_bios_mode = 3; video_crt_port = 0x3d4; video_status_port = 0x3da; video_is_color = 1;
   }
-  { unsigned u; for (u = 0; u < sizeof(vga_mem); u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }  /* Clear video buffer: space + light gray on black. */
+  { unsigned u; for (u = 0; u < 4000; u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }  /* Clear visible page (page 0, 80x25x2 = 4000 bytes). */
+  memset(vga_mem + 4000, 0, sizeof(vga_mem) - 4000);  /* Zero remaining pages. */
   g_dump_video_mem = vga_mem;
-  g_dump_video_size = sizeof(vga_mem);
+  g_dump_video_size = 4000;  /* Tests only see the visible page. */
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
   cleanup_fn[0] = '\0';
@@ -2779,9 +2780,20 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
           port_0x40_tick ^= 0x09;  /* Reuse tick var; toggles bits 0 and 3. */
           *p = port_0x40_tick & 0x09;
           break;
+        } else if (run->io.port >= 0x80 && run->io.port <= 0x8f) {
+          /* DMA page registers (0x80-0x8F). Port 0x80 is commonly used as
+           * a delay port; 0x81-0x8F are DMA page address registers.
+           * Silently ignore writes; reads return 0. */
+          if (run->io.direction == 0) memset(p, 0, run->io.size);
+          break;
         } else {
-          fprintf(stderr, "fatal: IO port: port=0x%02x data=%08x size=%d direction=%s\n", run->io.port, *(const unsigned*)p, run->io.size, run->io.direction ? "out" : "in");
-          goto fatal;
+          /* Unknown IO port. Real hardware returns 0xFF for reads on
+           * unconnected ports. Programs may read CGA/MDA status registers
+           * (e.g. port 0xBA for snow avoidance, 0x3DA for retrace wait)
+           * or other chipset ports that we don't emulate. Instead of
+           * crashing, return 0xFF for reads and ignore writes. */
+          if (run->io.direction == 0) memset(p, 0xff, run->io.size);
+          break;
         }
       }
      case KVM_EXIT_SHUTDOWN:  /* How do we trigger it? */
@@ -2831,7 +2843,10 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
           goto do_exit;
         } else if (int_num == 0x21) {  /* DOS file and memory sevices. */
           /* !! Should we set CF=0 by default? What does MS-DOS do? */
-          if (ah == 0x4d) {  /* Get child-process exit code (after ah=0x4b spawn). */
+          if (ah == 0x00) {  /* DOS 1.0 terminate (same as INT 20h). */
+            *(unsigned char*)&regs.rax = 0;
+            goto do_exit;
+          } else if (ah == 0x4d) {  /* Get child-process exit code (after ah=0x4b spawn). */
             *(unsigned char*)&regs.rax = last_spawn_exit_code;
             *(((unsigned char*)&regs.rax) + 1) = last_spawn_exit_type;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
