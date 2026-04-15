@@ -582,7 +582,8 @@ static void dump_video_on_signal(int sig) {
     /* Show where the CPU was when killed. Read IVT-area hlt stub pointer is not useful,
      * but we can show that video buffer was (not) rendered. */
     (void)!write(2, "--- video buffer dump ---\n", 25);
-    for (r = 0; r < 25; ++r) {
+    { unsigned rows = g_dump_video_size / (80 * 2); if (rows < 25) rows = 25; if (rows > 50) rows = 50;
+    for (r = 0; r < rows; ++r) {
       for (c = 0; c < 80; ++c) {
         unsigned ofs = (r * 80 + c) * 2;
         char ch = (ofs < g_dump_video_size) ? (char)g_dump_video_mem[ofs] : ' ';
@@ -590,7 +591,7 @@ static void dump_video_on_signal(int sig) {
         (void)!write(2, &ch, 1);
       }
       (void)!write(2, "\n", 1);
-    }
+    } }
     /* Count non-space chars in video buffer. */
     n = 0;
     for (c = 0; c < g_dump_video_size; c += 2) {
@@ -2583,7 +2584,8 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
   char port_0x40_tick;
   unsigned char video_write_step;
   char video_byte_written;
-  static unsigned char vga_mem[32768];  /* Text-mode video buffer. Real VGA has 32KB (8 pages of 80x25x2). Only first 4000 bytes (page 0) are visible. Static to avoid stack overflow in test threads. */
+  static unsigned char vga_mem[32768];  /* Text-mode video buffer. Real VGA has 32KB (8 pages of 80x25x2). Static to avoid stack overflow in test threads. */
+  unsigned char video_rows;  /* Current number of text rows (25, 43, or 50). */
   unsigned video_base;  /* Linear address of video buffer: 0xB8000 (color) or 0xB0000 (mono). */
   unsigned char video_bios_mode;  /* BIOS video mode: 3 (color 80x25) or 7 (mono 80x25). */
   unsigned short video_crt_port;  /* CRT controller base port: 0x3D4 (color) or 0x3B4 (mono). */
@@ -2626,10 +2628,11 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
   } else {
     video_base = 0xb8000; video_bios_mode = 3; video_crt_port = 0x3d4; video_status_port = 0x3da; video_is_color = 1;
   }
-  { unsigned u; for (u = 0; u < 4000; u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }  /* Clear visible page (page 0, 80x25x2 = 4000 bytes). */
-  memset(vga_mem + 4000, 0, sizeof(vga_mem) - 4000);  /* Zero remaining pages. */
+  video_rows = 25;
+  { unsigned u; for (u = 0; u < 80u * video_rows * 2; u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }  /* Clear visible page. */
+  memset(vga_mem + 80u * video_rows * 2, 0, sizeof(vga_mem) - 80u * video_rows * 2);  /* Zero remaining pages. */
   g_dump_video_mem = vga_mem;
-  g_dump_video_size = 4000;  /* Tests only see the visible page. */
+  g_dump_video_size = 80u * video_rows * 2;
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
   cleanup_fn[0] = '\0';
@@ -2654,6 +2657,11 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
    * https://stanislavs.org/helppc/bios_data_area.html
    */
   *(unsigned short*)((char*)mem + 0x410) = 0x22;  /* BIOS equipment flags. https://stanislavs.org/helppc/int_11.html */
+  *(unsigned char*)((char*)mem + 0x449) = video_bios_mode;  /* BDA: current video mode. */
+  *(unsigned short*)((char*)mem + 0x44a) = 80;  /* BDA: columns per row. */
+  *(unsigned short*)((char*)mem + 0x44c) = 80u * video_rows * 2;  /* BDA: video page size in bytes. */
+  *(unsigned short*)((char*)mem + 0x463) = video_crt_port;  /* BDA: CRT base port. */
+  *(unsigned char*)((char*)mem + 0x484) = video_rows - 1;  /* BDA: rows on screen minus 1. */
   ((char*)mem)[(INT_HLT_PARA << 4) - 1] = (char)0xcb;  /* `retf' opcode used by country case map. */
   /* Collating sequence table at 0x0420..0x0521 (before hlt table at 0x0540), for INT 21h/AH=65h/AL=06h.
    * Country info copy at 0x0522..0x0539 (sizeof country_info == 0x18), for INT 21h/AH=65h/AL=01h.
@@ -4831,16 +4839,18 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             *(unsigned short*)&regs.rax = 80 << 8 | video_bios_mode;  /* AH=columns, AL=mode. */
             ((unsigned char*)&regs.rbx)[1] = 0;  /* BH := page (0). */
           } else if (ah == 0x00) {  /* Set video mode. */
-            /* AL = mode. We support mode 3 (color 80x25) and mode 7 (mono 80x25). Just clear the video buffer. */
-            { unsigned u; for (u = 0; u < sizeof(vga_mem); u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }
+            /* AL = mode. We support mode 3 (color 80x25) and mode 7 (mono 80x25). Mode set resets to 25 rows. */
+            video_rows = 25;
+            { unsigned u; for (u = 0; u < 80u * video_rows * 2; u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }
+            g_dump_video_size = 80u * video_rows * 2;
             *(unsigned short*)((char*)mem + 0x450) = 0;  /* Cursor pos page 0: row=0, col=0. */
             *(unsigned char*)((char*)mem + 0x449) = video_bios_mode;  /* BDA: current video mode. */
             *(unsigned short*)((char*)mem + 0x44a) = 80;  /* BDA: columns per row. */
-            *(unsigned short*)((char*)mem + 0x44c) = 4000;  /* BDA: video page size in bytes. */
+            *(unsigned short*)((char*)mem + 0x44c) = 80u * video_rows * 2;  /* BDA: video page size in bytes. */
             *(unsigned short*)((char*)mem + 0x44e) = 0;  /* BDA: active page offset. */
             *(unsigned char*)((char*)mem + 0x462) = 0;  /* BDA: active display page. */
             *(unsigned short*)((char*)mem + 0x463) = video_crt_port;  /* BDA: CRT base port. */
-            *(unsigned char*)((char*)mem + 0x484) = 24;  /* BDA: rows on screen minus 1. */
+            *(unsigned char*)((char*)mem + 0x484) = video_rows - 1;  /* BDA: rows on screen minus 1. */
           } else if (ah == 0x06 || ah == 0x07) {  /* Scroll window up (06) / down (07). */
             const unsigned char lines = (unsigned char)regs.rax;
             const unsigned char attr = ((unsigned char*)&regs.rbx)[1];  /* BH = fill attribute. */
@@ -4852,7 +4862,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             unsigned r;
             if (lines == 0 || lines > row_bot - row_top) {
               /* Clear the entire window. */
-              for (r = row_top; r <= row_bot && r < 25; ++r) {
+              for (r = row_top; r <= row_bot && r < video_rows; ++r) {
                 unsigned c;
                 for (c = 0; c < width && col_left + c < 80; ++c) {
                   vga_mem[(r * 80 + col_left + c) * 2] = ' ';
@@ -4860,7 +4870,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                 }
               }
             } else if (ah == 0x06) {  /* Scroll up. */
-              for (r = row_top; r <= row_bot && r < 25; ++r) {
+              for (r = row_top; r <= row_bot && r < video_rows; ++r) {
                 unsigned c;
                 for (c = 0; c < width && col_left + c < 80; ++c) {
                   unsigned dst = (r * 80 + col_left + c) * 2;
@@ -4875,7 +4885,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                 }
               }
             } else {  /* Scroll down (ah == 0x07). */
-              for (r = row_bot; r >= row_top && r < 25; --r) {
+              for (r = row_bot; r >= row_top && r < video_rows; --r) {
                 unsigned c;
                 for (c = 0; c < width && col_left + c < 80; ++c) {
                   unsigned dst = (r * 80 + col_left + c) * 2;
@@ -4897,11 +4907,27 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 0x30) {  /* Get font information. */
               /* Return: CX = bytes per character, DL = rows - 1. */
-              *(unsigned short*)&regs.rcx = 16;  /* 16 bytes per character (8x16 font). */
-              *(unsigned char*)&regs.rdx = 24;  /* 25 rows - 1 = 24. */
+              *(unsigned short*)&regs.rcx = (video_rows <= 25) ? 16 : (video_rows <= 28) ? 14 : 8;
+              *(unsigned char*)&regs.rdx = video_rows - 1;
               /* ES:BP would point to font table, but we don't provide one. */
+            } else if (al == 0x11 || al == 0x12) {
+              /* AL=11h: Load 8x14 font (ROM BIOS) -> 28 rows on VGA, 43 on EGA.
+               * AL=12h: Load 8x8 font (ROM BIOS) -> 50 rows.
+               * BL=0 means load to block 0 (active). */
+              video_rows = (al == 0x12) ? 50 : 43;
+              *(unsigned char*)((char*)mem + 0x484) = video_rows - 1;
+              *(unsigned short*)((char*)mem + 0x44c) = 80u * video_rows * 2;
+              g_dump_video_size = 80u * video_rows * 2;
+              /* Clear the newly visible rows. */
+              { unsigned u; for (u = 80u * 25 * 2; u < 80u * video_rows * 2; u += 2) { vga_mem[u] = ' '; vga_mem[u + 1] = 0x07; } }
+            } else if (al == 0x14) {
+              /* AL=14h: Load 8x16 font (VGA) -> 25 rows. */
+              video_rows = 25;
+              *(unsigned char*)((char*)mem + 0x484) = 24;
+              *(unsigned short*)((char*)mem + 0x44c) = 80u * 25 * 2;
+              g_dump_video_size = 80u * 25 * 2;
             }
-            /* Other AL values (load font, etc.) are no-ops. */
+            /* Other AL values (user font loading, etc.) are no-ops. */
           } else {
             goto fatal_int;
           }
