@@ -264,6 +264,28 @@ void kviktest_clear_dos_error(void) {
   g_test_dos_inject.ah = 0;
 }
 
+void kviktest_mouse_enable(void) {
+  g_mouse_installed = 1;
+}
+
+void kviktest_send_mouse(int x, int y, int buttons) {
+  mouse_ring_push((unsigned short)x, (unsigned short)y, (unsigned short)buttons);
+}
+
+void kviktest_click(int row, int col, int button) {
+  /* Send press then release. Delay 200ms between them so the DOS program
+   * has time to poll INT 33h and see the button press before it's released. */
+  mouse_ring_push((unsigned short)col, (unsigned short)row, (unsigned short)button);
+  usleep(200000);
+  mouse_ring_push((unsigned short)col, (unsigned short)row, 0);
+}
+
+void kviktest_read_mouse(int *x, int *y, int *buttons) {
+  if (x) *x = g_mouse_x;
+  if (y) *y = g_mouse_y;
+  if (buttons) *buttons = g_mouse_buttons;
+}
+
 int kviktest_coverage_dump(const char *path) {
   const unsigned char *bmp = cpu8086_coverage_bitmap();
   FILE *f;

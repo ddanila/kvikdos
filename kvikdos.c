@@ -506,6 +506,74 @@ static int key_ring_pop(unsigned short *key_out) {
   return 1;
 }
 
+/* Mouse event ring buffer for test harness (thread-safe, same pattern as key ring).
+ * Each entry holds text-cell coordinates and button state.
+ * Used when g_mouse_installed is set (via kviktest_mouse_enable). */
+#define MOUSE_RING_SIZE 64
+typedef struct { unsigned short x, y, buttons; } MouseEvent;
+static volatile MouseEvent g_mouse_ring[MOUSE_RING_SIZE];
+static volatile unsigned g_mouse_ring_head;
+static volatile unsigned g_mouse_ring_tail;
+
+/* Mouse driver state — volatile for cross-thread visibility. */
+static volatile unsigned short g_mouse_x, g_mouse_y, g_mouse_buttons;
+KVIKDOS_STATIC volatile int g_mouse_installed;  /* 0=no mouse, 1=installed. Set by test harness. */
+static volatile int g_mouse_visible;  /* Visibility counter: >0 means cursor shown. */
+static unsigned short g_mouse_x_max = 79, g_mouse_y_max = 24;  /* Text cell range. */
+static unsigned short g_mouse_cursor_and = 0xFFFF;  /* Text cursor AND mask (default: keep all). */
+static unsigned short g_mouse_cursor_xor = 0x7700;  /* Text cursor XOR mask (default: reverse block). */
+static unsigned char g_mouse_saved_char, g_mouse_saved_attr;  /* Char under cursor. */
+static unsigned short g_mouse_cursor_drawn_at = 0xFFFF;  /* Offset in vga_mem, or 0xFFFF if not drawn. */
+
+KVIKDOS_STATIC void mouse_ring_push(unsigned short x, unsigned short y, unsigned short buttons) {
+  unsigned next_head = (g_mouse_ring_head + 1) % MOUSE_RING_SIZE;
+  while (next_head == g_mouse_ring_tail) { usleep(1000); }  /* Spin if full. */
+  g_mouse_ring[g_mouse_ring_head].x = x;
+  g_mouse_ring[g_mouse_ring_head].y = y;
+  g_mouse_ring[g_mouse_ring_head].buttons = buttons;
+  g_mouse_ring_head = next_head;
+}
+
+static int mouse_ring_pop(MouseEvent *out) {
+  if (g_mouse_ring_tail == g_mouse_ring_head) return 0;  /* Empty. */
+  *out = g_mouse_ring[g_mouse_ring_tail];
+  g_mouse_ring_tail = (g_mouse_ring_tail + 1) % MOUSE_RING_SIZE;
+  return 1;
+}
+
+/* Process at most one pending mouse event, updating global state.
+ * Only one event per INT 33h call ensures press/release are seen separately. */
+static void mouse_drain_events(void) {
+  MouseEvent ev;
+  if (mouse_ring_pop(&ev)) {
+    g_mouse_x = ev.x <= g_mouse_x_max ? ev.x : g_mouse_x_max;
+    g_mouse_y = ev.y <= g_mouse_y_max ? ev.y : g_mouse_y_max;
+    g_mouse_buttons = ev.buttons;
+  }
+}
+
+/* Draw or erase the text-mode mouse cursor in vga_mem.
+ * vga_mem must be the emulator's VGA text buffer (80x25x2 = 4000 bytes). */
+static void mouse_update_cursor(unsigned char *vga_mem) {
+  /* Erase old cursor if drawn. */
+  if (g_mouse_cursor_drawn_at != 0xFFFF && g_mouse_cursor_drawn_at < 4000) {
+    vga_mem[g_mouse_cursor_drawn_at] = g_mouse_saved_char;
+    vga_mem[g_mouse_cursor_drawn_at + 1] = g_mouse_saved_attr;
+    g_mouse_cursor_drawn_at = 0xFFFF;
+  }
+  /* Draw new cursor if visible. */
+  if (g_mouse_visible > 0) {
+    unsigned short ofs = (g_mouse_y * 80 + g_mouse_x) * 2;
+    if (ofs < 4000) {
+      g_mouse_saved_char = vga_mem[ofs];
+      g_mouse_saved_attr = vga_mem[ofs + 1];
+      vga_mem[ofs] = (unsigned char)((g_mouse_saved_char & (g_mouse_cursor_and & 0xFF)) ^ (g_mouse_cursor_xor & 0xFF));
+      vga_mem[ofs + 1] = (unsigned char)((g_mouse_saved_attr & (g_mouse_cursor_and >> 8)) ^ (g_mouse_cursor_xor >> 8));
+      g_mouse_cursor_drawn_at = ofs;
+    }
+  }
+}
+
 static void dump_video_on_signal(int sig) {
   if (g_dump_video_mem && g_dump_video_size) {
     unsigned r, c;
@@ -4857,12 +4925,81 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
           } else {
             goto fatal_int;
           }
-        } else if (int_num == 0x33) {  /* Mouse driver. */
-          if (ah == 0x00) {  /* Mouse reset / get status. */
-            *(unsigned short*)&regs.rax = 0;  /* AX=0: no mouse installed. */
-            *(unsigned short*)&regs.rbx = 0;  /* BX=0: no buttons. */
+        } else if (int_num == 0x33) {  /* Mouse driver (INT 33h). */
+          const unsigned short mouse_ax = *(const unsigned short*)&regs.rax;
+          const unsigned char mouse_func = mouse_ax & 0xFF;  /* AL=function for most; AX for func 0x21. */
+          if (mouse_ax == 0x0021) {  /* AX=0021h: alternate init / status query. */
+            if (g_mouse_installed) {
+              *(unsigned short*)&regs.rax = 0x0021;  /* Echo back: driver present. */
+            } else {
+              *(unsigned short*)&regs.rax = 0;
+            }
+          } else if (mouse_func == 0x00) {  /* AX=0000h: reset / detect. */
+            if (g_mouse_installed) {
+              mouse_drain_events();
+              /* Erase cursor before reset. */
+              if (g_mouse_cursor_drawn_at != 0xFFFF) { mouse_update_cursor(vga_mem); }
+              g_mouse_visible = 0;
+              g_mouse_x = g_mouse_y = 0;
+              g_mouse_buttons = 0;
+              g_mouse_x_max = 79; g_mouse_y_max = 24;
+              g_mouse_cursor_and = 0xFFFF; g_mouse_cursor_xor = 0x7700;
+              g_mouse_cursor_drawn_at = 0xFFFF;
+              *(unsigned short*)&regs.rax = 0xFFFF;  /* AX=FFFFh: mouse installed. */
+              *(unsigned short*)&regs.rbx = 2;       /* BX=2: two buttons. */
+            } else {
+              *(unsigned short*)&regs.rax = 0;  /* AX=0: no mouse. */
+              *(unsigned short*)&regs.rbx = 0;
+            }
+          } else if (mouse_func == 0x01) {  /* Show cursor. */
+            if (g_mouse_installed) {
+              g_mouse_visible++;
+              mouse_drain_events();
+              mouse_update_cursor(vga_mem);
+            }
+          } else if (mouse_func == 0x02) {  /* Hide cursor. */
+            if (g_mouse_installed) {
+              if (g_mouse_visible > 0) g_mouse_visible--;
+              mouse_update_cursor(vga_mem);
+            }
+          } else if (mouse_func == 0x03) {  /* Get position + button state. */
+            if (g_mouse_installed) {
+              mouse_drain_events();
+              if (g_mouse_visible > 0) mouse_update_cursor(vga_mem);
+              *(unsigned short*)&regs.rbx = g_mouse_buttons;
+              *(unsigned short*)&regs.rcx = g_mouse_x * 8;  /* Pixel coords (text col × 8). */
+              *(unsigned short*)&regs.rdx = g_mouse_y * 8;  /* Pixel coords (text row × 8). */
+            } else {
+              *(unsigned short*)&regs.rbx = 0;
+              *(unsigned short*)&regs.rcx = 0;
+              *(unsigned short*)&regs.rdx = 0;
+            }
+          } else if (mouse_func == 0x04) {  /* Set position. */
+            if (g_mouse_installed) {
+              unsigned short nx = *(const unsigned short*)&regs.rcx / 8;
+              unsigned short ny = *(const unsigned short*)&regs.rdx / 8;
+              g_mouse_x = nx <= g_mouse_x_max ? nx : g_mouse_x_max;
+              g_mouse_y = ny <= g_mouse_y_max ? ny : g_mouse_y_max;
+              if (g_mouse_visible > 0) mouse_update_cursor(vga_mem);
+            }
+          } else if (mouse_func == 0x07) {  /* Set horizontal range. */
+            if (g_mouse_installed) {
+              g_mouse_x_max = *(const unsigned short*)&regs.rdx / 8;
+              if (g_mouse_x_max > 79) g_mouse_x_max = 79;
+            }
+          } else if (mouse_func == 0x08) {  /* Set vertical range. */
+            if (g_mouse_installed) {
+              g_mouse_y_max = *(const unsigned short*)&regs.rdx / 8;
+              if (g_mouse_y_max > 24) g_mouse_y_max = 24;
+            }
+          } else if (mouse_func == 0x0A) {  /* Define text cursor. */
+            if (g_mouse_installed) {
+              g_mouse_cursor_and = *(const unsigned short*)&regs.rcx;
+              g_mouse_cursor_xor = *(const unsigned short*)&regs.rdx;
+              if (g_mouse_visible > 0) mouse_update_cursor(vga_mem);
+            }
           } else {
-            /* All other mouse calls: silently ignore (no mouse). */
+            /* Unimplemented mouse function — silently ignore. */
             *(unsigned short*)&regs.rax = 0;
           }
         } else if (int_num == 0x28) {  /* DOS idle — called while waiting for input. */

@@ -144,4 +144,27 @@ void kviktest_inject_dos_error(unsigned char ah, unsigned short error_code, int 
  */
 void kviktest_clear_dos_error(void);
 
+/*
+ * Enable mouse driver emulation. Call before kviktest_start().
+ * Default is disabled (INT 33h returns "no mouse") for backward compat.
+ */
+void kviktest_mouse_enable(void);
+
+/*
+ * Inject a mouse event: text-cell position + button state.
+ * buttons: bit 0 = left, bit 1 = right, bit 2 = middle. 0 = all released.
+ */
+void kviktest_send_mouse(int x, int y, int buttons);
+
+/*
+ * Convenience: click at text cell (col, row). Sends press then release.
+ * button: 1 = left, 2 = right.
+ */
+void kviktest_click(int row, int col, int button);
+
+/*
+ * Read current mouse state from the emulator.
+ */
+void kviktest_read_mouse(int *x, int *y, int *buttons);
+
 #endif /* TEST_HARNESS_H */
