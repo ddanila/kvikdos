@@ -4832,6 +4832,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               sphinx_cmm_flags |= 2;
               *(unsigned short*)&regs.rbx = (video_is_color ? 0 : 1) << 8 | 3;  /* BH=0: color or 1: mono. BL=3: 256 KiB EGA memory. */
               *(unsigned short*)&regs.rcx = 0;  /* Feature bits and switch settings. */
+            } else if (bl == 0x20) {  /* Select alternate print screen routine (EGA/VGA). No-op. */
             } else {
               fprintf(stderr, "fatal: unsupported subcall for video subsystem configuration: 0x%02x\n", bl);
               goto fatal;

@@ -139,9 +139,18 @@ void kviktest_send_key(unsigned short key) {
   key_ring_push(key);
 }
 
+int kviktest_get_rows(void) {
+  if (!g_dump_video_size) return 25;
+  { int rows = g_dump_video_size / (80 * 2);
+    if (rows < 25) return 25;
+    if (rows > 50) return 50;
+    return rows;
+  }
+}
+
 char kviktest_read_char(int row, int col) {
   unsigned ofs;
-  if (row < 0 || row >= 25 || col < 0 || col >= 80) return 0;
+  if (row < 0 || row >= kviktest_get_rows() || col < 0 || col >= 80) return 0;
   if (!g_dump_video_mem || !g_dump_video_size) return 0;
   ofs = (unsigned)((row * 80 + col) * 2);
   if (ofs >= g_dump_video_size) return 0;
@@ -189,7 +198,7 @@ int kviktest_find_text(const char *text, int *out_row, int *out_col) {
   int len = (int)strlen(text);
   int r, c;
   char buf[81];
-  for (r = 0; r < 25; ++r) {
+  for (r = 0; r < kviktest_get_rows(); ++r) {
     kviktest_read_text(r, 0, buf, 81);
     for (c = 0; c <= 80 - len; ++c) {
       if (memcmp(buf + c, text, len) == 0) {

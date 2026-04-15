@@ -65,6 +65,12 @@ int kviktest_wait_exit(unsigned timeout_ms);
 void kviktest_send_key(unsigned short key);
 
 /*
+ * Get the current number of video rows (25, 43, or 50).
+ * Derived from g_dump_video_size at runtime.
+ */
+int kviktest_get_rows(void);
+
+/*
  * Read a character from the video buffer at (row, col).
  * Returns the ASCII character, or 0 if out of bounds.
  */
