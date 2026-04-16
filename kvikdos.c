@@ -4581,9 +4581,12 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                 goto fatal_int;
               }
               if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
-                /*goto error_from_linux;*/  /* We don't know how to report the error properly here (it's not a normal int 0x21 call. */
-                fprintf(stderr, "fatal: cannot open DOS executable program for loading: %s: %s\n", prog_filename, strerror(errno));
-                goto fatal_int;
+                /* Return DOS error instead of crashing — VC.COM handles exec
+                 * failure gracefully (shows "Press ENTER" prompt). */
+                if (is_args_normal) args[args_size] = '\r';
+                if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: file not found: %s: %s\n", prog_filename, strerror(errno));
+                *(unsigned short*)&regs.rax = (errno == ENOENT) ? 2 : 5;  /* 2=file not found, 5=access denied */
+                goto error_on_21;
               }
               *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
               memcpy(new_env = (char*)mem + (ENV_PARA << 4), env, env_end + 2 - env);
