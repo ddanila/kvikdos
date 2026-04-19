@@ -49,6 +49,47 @@ volatile int g_cpu8086_abort;
 /* These replace XTulator's memory.c — we use kvikdos's flat buffer.    */
 /* -------------------------------------------------------------------- */
 
+/* INVARS (DOS List of Lists) region. Reads at 0xFFF7E..0xFFFB3 must
+ * return the synthetic MCB/DOS-internals data that kvikdos's KVM path
+ * serves via the MMIO handler (kvikdos.c:5193). The software CPU
+ * routes memory reads through cpu_read() directly instead of trapping
+ * to the MMIO handler before the instruction completes, so we have
+ * to answer inline here. Without this, reads of INVARS return the
+ * raw BIOS-ROM 0xFF bytes and programs like MEM.EXE and VC's
+ * Memory Info see an empty/bogus MCB chain.
+ *
+ * Layout matches kvikdos.c's invars_data[]:
+ *   -0x02: first MCB segment (PROGRAM_MCB_PARA, little-endian)
+ *   +0x00..+0x21: DOS internals (all zero for our purposes)
+ *   +0x22: NUL device header (18 bytes, ends device-driver chain)
+ */
+#define SOFT_INVARS_BASE   0xFFF7EU
+#define SOFT_INVARS_END    0xFFFB4U   /* exclusive */
+#define SOFT_PROGRAM_MCB   0xFFU      /* matches PSP_PARA-1 in kvikdos.c */
+
+static uint8_t soft_invars_byte(uint32_t addr) {
+	uint32_t ofs = addr - SOFT_INVARS_BASE;
+	/* -0x02..-0x01: first-MCB-segment little-endian */
+	if (ofs == 0) return (uint8_t)(SOFT_PROGRAM_MCB & 0xFF);
+	if (ofs == 1) return (uint8_t)((SOFT_PROGRAM_MCB >> 8) & 0xFF);
+	/* +0x22..+0x25: NUL header "next device = FFFF:FFFF" */
+	if (ofs >= 0x24 && ofs <= 0x27) return 0xFF;
+	/* +0x26..+0x27: attribute = 0x8004 (character device + NUL) */
+	if (ofs == 0x28) return 0x04;
+	if (ofs == 0x29) return 0x80;
+	/* +0x2E..+0x35: device name "NUL     " */
+	if (ofs == 0x2C) return 'N';
+	if (ofs == 0x2D) return 'U';
+	if (ofs == 0x2E) return 'L';
+	if (ofs >= 0x2F && ofs <= 0x33) return ' ';
+	return 0;  /* all other INVARS bytes */
+}
+
+/* Read a single byte at paragraph mcb_seg. The MCB at `mcb_seg` lives
+ * in guest RAM (below 640 KB), so it's already served by the g_ctx.mem
+ * branch in cpu_read. Nothing to do here for the MCB itself — the
+ * fields are laid out by DOS/kvikdos at allocation time. */
+
 uint8_t cpu_read(CPU_t* cpu, uint32_t addr) {
 	(void)cpu;
 	addr &= 0xFFFFF; /* 1MB wrap */
@@ -57,6 +98,9 @@ uint8_t cpu_read(CPU_t* cpu, uint32_t addr) {
 	}
 	if (addr - g_ctx.video_base < g_ctx.vga_mem_size) {
 		return g_ctx.vga_mem[addr - g_ctx.video_base];
+	}
+	if (addr >= SOFT_INVARS_BASE && addr < SOFT_INVARS_END) {
+		return soft_invars_byte(addr);
 	}
 	/* MMIO: address beyond guest RAM. */
 	g_ctx.run->exit_reason = KVM_EXIT_MMIO;
