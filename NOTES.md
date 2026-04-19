@@ -12,6 +12,14 @@
 - `__linux__` is only for genuinely OS-specific behavior (madvise semantics, xattr API).
 - Linux default build: KVM. macOS: soft CPU. Test harness: always soft CPU.
 - New code that differs between KVM and soft CPU must use `#ifdef USE_KVM`, never `#ifdef __linux__`.
+- Synthetic high-memory regions like INVARS (DOS List of Lists at
+  0xFFF7E..0xFFFB3) are served in two places: the KVM exit path
+  handles them in `kvikdos.c` via the MMIO handler, and `cpu8086.c`'s
+  `cpu_read()` answers the same bytes inline before it would fall
+  through to the MMIO exit. The soft-CPU version MUST stay in sync
+  with the KVM stub — an instruction like `mov ax, es:[bx-2]`
+  completes within one `cpu_exec()` call, so setting exit_pending
+  isn't enough; we have to return real data for the second byte too.
 
 ## Validation and --azzy
 
