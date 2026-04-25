@@ -139,6 +139,13 @@ void kviktest_send_key(unsigned short key) {
   key_ring_push(key);
 }
 
+void kviktest_set_shift_flags(unsigned char flags) {
+  extern void *g_test_mem;
+  if (g_test_mem) {
+    ((unsigned char*)g_test_mem)[0x417] = flags;
+  }
+}
+
 int kviktest_get_rows(void) {
   if (!g_dump_video_size) return 25;
   { int rows = g_dump_video_size / (80 * 2);

@@ -65,6 +65,12 @@ int kviktest_wait_exit(unsigned timeout_ms);
 void kviktest_send_key(unsigned short key);
 
 /*
+ * Set BIOS keyboard shift flags at BDA 0040:0017.
+ * Bit 3 = Alt, bit 2 = Ctrl, bits 0/1 = Shift.
+ */
+void kviktest_set_shift_flags(unsigned char flags);
+
+/*
  * Get the current number of video rows (25, 43, or 50).
  * Derived from g_dump_video_size at runtime.
  */

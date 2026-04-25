@@ -485,6 +485,7 @@ static volatile unsigned short g_key_ring[KEY_RING_SIZE];
 static volatile unsigned g_key_ring_head;  /* Next write position. */
 static volatile unsigned g_key_ring_tail;  /* Next read position. */
 static volatile int g_key_ring_abort;  /* Set to 1 to unblock waiting readers. */
+void *g_test_mem;
 
 KVIKDOS_STATIC void key_ring_push(unsigned short key) {
   unsigned next_head = (g_key_ring_head + 1) % KEY_RING_SIZE;
@@ -2644,6 +2645,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
   sregs = emu->initial_sregs;
   kvm_fds = emu->kvm_fds;
   mem = emu->mem;
+  g_test_mem = mem;
   run = emu->kvm_run;
   memset(&regs, '\0', sizeof(regs));
 
