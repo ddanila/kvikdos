@@ -49,4 +49,8 @@ void cpu8086_coverage_reset(void);
 unsigned cpu8086_coverage_count(unsigned start, unsigned size);
 const unsigned char *cpu8086_coverage_bitmap(void);
 
+/* Dump the last ~256 executed instructions to stderr. Called from the
+ * fatal handler in kvikdos.c to diagnose wild jumps / bad memory access. */
+void cpu8086_dump_trace(void);
+
 #endif /* CPU8086_H */

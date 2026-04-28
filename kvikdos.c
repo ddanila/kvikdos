@@ -5282,6 +5282,7 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
     }
   }
  fatal:
+  cpu8086_dump_trace();
   dump_regs("fatal", &regs, &sregs);
 #if 0  /* The Linux kernel does this at process exit. */
   close(kvm_fds.vcpu_fd);

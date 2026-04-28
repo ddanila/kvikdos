@@ -44,6 +44,33 @@ static int g_coverage_enabled;
 /* Abort flag: checked in the execution loop to force-exit the emulator. */
 volatile int g_cpu8086_abort;
 
+/* Circular instruction trace: captures (cs, ip, opcode bytes, sp, flags)
+ * for the last TRACE_SIZE instructions executed.  Used by
+ * cpu8086_dump_trace() to diagnose wild jumps / corrupt-stack faults. */
+#define TRACE_SIZE 256
+struct trace_entry {
+	uint16_t cs;
+	uint16_t ip;
+	uint16_t cs_after;
+	uint16_t ip_after;
+	uint16_t sp_before;
+	uint16_t ss_before;
+	uint16_t ax, bx, cx, dx;
+	uint8_t bytes[6];
+};
+static struct trace_entry g_trace[TRACE_SIZE];
+static unsigned g_trace_pos;       /* next slot to write */
+static unsigned long long g_trace_total;
+
+/* CS-change trace: separately captures the last CS_TRACE_SIZE instructions
+ * that changed CS (cross-segment branch).  This is much smaller per-iteration
+ * (skipped for normal instructions), so a small ring captures a useful
+ * window across an entire 1B-instruction run. */
+#define CS_TRACE_SIZE 64
+static struct trace_entry g_cs_trace[CS_TRACE_SIZE];
+static unsigned g_cs_trace_pos;
+static unsigned long long g_cs_trace_total;
+
 /* -------------------------------------------------------------------- */
 /* Memory access callbacks for XTulator CPU core.                       */
 /* These replace XTulator's memory.c — we use kvikdos's flat buffer.    */
@@ -386,7 +413,38 @@ int cpu8086_run(struct kvm_regs *regs, struct kvm_sregs *sregs,
 			}
 			if (g_coverage_enabled) sched_yield();
 		}
-		cpu_exec(&cpu, 1);
+		{
+			struct trace_entry *te = &g_trace[g_trace_pos];
+			unsigned cs = cpu.segregs[regcs];
+			unsigned ip = cpu.ip;
+			unsigned linear = ((cs << 4) + ip) & 0xFFFFF;
+			te->cs = (uint16_t)cs;
+			te->ip = (uint16_t)ip;
+			te->sp_before = cpu.regs.wordregs[regsp];
+			te->ss_before = cpu.segregs[regss];
+			te->ax = cpu.regs.wordregs[regax];
+			te->bx = cpu.regs.wordregs[regbx];
+			te->cx = cpu.regs.wordregs[regcx];
+			te->dx = cpu.regs.wordregs[regdx];
+			{
+				unsigned i;
+				for (i = 0; i < 6; ++i) {
+					unsigned a = (linear + i) & 0xFFFFF;
+					if (a < g_ctx.mem_size) te->bytes[i] = g_ctx.mem[a];
+					else te->bytes[i] = 0xFF;
+				}
+			}
+			cpu_exec(&cpu, 1);
+			te->cs_after = (uint16_t)cpu.segregs[regcs];
+			te->ip_after = (uint16_t)cpu.ip;
+			g_trace_pos = (g_trace_pos + 1) % TRACE_SIZE;
+			++g_trace_total;
+			if (te->cs_after != te->cs) {
+				g_cs_trace[g_cs_trace_pos] = *te;
+				g_cs_trace_pos = (g_cs_trace_pos + 1) % CS_TRACE_SIZE;
+				++g_cs_trace_total;
+			}
+		}
 		/* Mark ALL bytes of the executed instruction in the coverage bitmap.
 		 * After cpu_exec, cpu.ip points to the next instruction. For
 		 * sequential execution (no jump), ip_after - ip_before = insn length.
@@ -444,4 +502,59 @@ unsigned cpu8086_coverage_count(unsigned start, unsigned size) {
 /* Get raw bitmap pointer for external analysis. */
 const unsigned char *cpu8086_coverage_bitmap(void) {
 	return g_coverage_bitmap;
+}
+
+/* Dump the last TRACE_SIZE executed instructions to stderr.  Called from
+ * the kvikdos fatal handler when a wild jump or bad memory access occurs;
+ * the trailing entries identify the instruction that misbehaved. */
+void cpu8086_dump_trace(void) {
+	unsigned shown;
+	unsigned start;
+	if (g_cs_trace_total > 0) {
+		unsigned cshown = (g_cs_trace_total < CS_TRACE_SIZE) ?
+		                  (unsigned)g_cs_trace_total : CS_TRACE_SIZE;
+		unsigned cstart = (g_cs_trace_pos + CS_TRACE_SIZE - cshown) % CS_TRACE_SIZE;
+		unsigned i;
+		fprintf(stderr,
+		        "cpu8086 cs-change trace (last %u of %llu cross-segment branches):\n",
+		        cshown, g_cs_trace_total);
+		for (i = 0; i < cshown; ++i) {
+			struct trace_entry *te =
+			    &g_cs_trace[(cstart + i) % CS_TRACE_SIZE];
+			fprintf(stderr,
+			        "  %4u: %04x:%04x  %02x %02x %02x %02x %02x %02x  "
+			        "-> %04x:%04x  ax=%04x bx=%04x cx=%04x dx=%04x  ss:sp=%04x:%04x\n",
+			        i,
+			        te->cs, te->ip,
+			        te->bytes[0], te->bytes[1], te->bytes[2],
+			        te->bytes[3], te->bytes[4], te->bytes[5],
+			        te->cs_after, te->ip_after,
+			        te->ax, te->bx, te->cx, te->dx,
+			        te->ss_before, te->sp_before);
+		}
+	}
+	if (g_trace_total == 0) {
+		fprintf(stderr, "cpu8086 trace: empty\n");
+		return;
+	}
+	shown = (g_trace_total < TRACE_SIZE) ? (unsigned)g_trace_total : TRACE_SIZE;
+	start = (g_trace_pos + TRACE_SIZE - shown) % TRACE_SIZE;
+	fprintf(stderr, "cpu8086 trace (last %u of %llu instructions):\n",
+	        shown, g_trace_total);
+	{
+		unsigned i;
+		for (i = 0; i < shown; ++i) {
+			struct trace_entry *te = &g_trace[(start + i) % TRACE_SIZE];
+			fprintf(stderr,
+			        "  %4u: %04x:%04x  %02x %02x %02x %02x %02x %02x  "
+			        "-> %04x:%04x  ax=%04x bx=%04x cx=%04x dx=%04x  ss:sp=%04x:%04x\n",
+			        i,
+			        te->cs, te->ip,
+			        te->bytes[0], te->bytes[1], te->bytes[2],
+			        te->bytes[3], te->bytes[4], te->bytes[5],
+			        te->cs_after, te->ip_after,
+			        te->ax, te->bx, te->cx, te->dx,
+			        te->ss_before, te->sp_before);
+		}
+	}
 }
