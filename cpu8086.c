@@ -15,6 +15,7 @@
 
 #include <sched.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 
@@ -139,6 +140,31 @@ uint8_t cpu_read(CPU_t* cpu, uint32_t addr) {
 }
 
 void cpu_write(CPU_t* cpu, uint32_t addr, uint8_t value) {
+	/* Diagnostic: track min SP and warn when stack descends below
+	 * a threshold supplied by env var KVIKDOS_BSS_END (linear addr,
+	 * decimal). Prints first 5 underflow events to stderr. */
+	{
+		static uint16_t min_sp_seen = 0xFFFF;
+		static int       under_prints = 0;
+		static int       env_read = 0;
+		static unsigned  bss_end_thresh = 0;
+		uint16_t sp = cpu->regs.wordregs[regsp];
+		uint16_t ss = cpu->segregs[regss];
+		if (!env_read) {
+			const char *e = getenv("KVIKDOS_BSS_END");
+			if (e) bss_end_thresh = (unsigned)atoi(e);
+			env_read = 1;
+		}
+		if (sp < min_sp_seen) {
+			min_sp_seen = sp;
+			if (bss_end_thresh && (((unsigned)ss << 4) + sp) < ((0x100u << 4) + bss_end_thresh) && under_prints < 5) {
+				fprintf(stderr, "STACK_WARN: SS:SP=%04x:%04x (linear=0x%05x), writing addr=0x%05x, cs:ip=%04x:%04x\n",
+				        ss, sp, ((unsigned)ss << 4) + sp, addr & 0xFFFFF,
+				        cpu->segregs[regcs], cpu->ip);
+				under_prints++;
+			}
+		}
+	}
 	(void)cpu;
 	addr &= 0xFFFFF;
 	if (addr < g_ctx.mem_size) {
