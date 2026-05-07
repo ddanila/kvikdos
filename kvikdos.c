@@ -3662,11 +3662,22 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                 MCB_PSIZE_PARA(next_mcb) = MCB_SIZE_PARA(mcb) = available_para;
               } else {  /* Make the following free block smaller or larger. */
                 char * const next_mcb2 = mcb + 16 + (new_size_para << 4);
+                const char next_type = MCB_TYPE(next_mcb);
+                /* If next_mcb is the last (Z-type) free block there is no
+                 * next-next MCB to update, and the new free block must
+                 * inherit Z-type so the chain still terminates. The old
+                 * code unconditionally wrote 'M' and a psize past the end
+                 * of the arena, producing fatal "bad next/free MCB after
+                 * inplace_realloc(): 10" when the corrupted bytes happened
+                 * to look like an adjacent free block. */
+                const unsigned new_free_size = MCB_SIZE_PARA(next_mcb) + old_size_para - new_size_para;
                 memcpy(next_mcb2, default_program_mcb, 16);
-                MCB_TYPE(next_mcb2) = 'M';
+                MCB_TYPE(next_mcb2) = next_type;
                 MCB_PID(next_mcb2) = 0;  /* Mark as free. */
-                MCB_PSIZE_PARA(next_mcb + 16 + (MCB_SIZE_PARA(next_mcb) << 4)) =
-                    MCB_SIZE_PARA(next_mcb2) = MCB_SIZE_PARA(next_mcb) + old_size_para - new_size_para;
+                MCB_SIZE_PARA(next_mcb2) = new_free_size;
+                if (next_type != 'Z') {
+                  MCB_PSIZE_PARA(next_mcb + 16 + (MCB_SIZE_PARA(next_mcb) << 4)) = new_free_size;
+                }
                 MCB_PSIZE_PARA(next_mcb2) = MCB_SIZE_PARA(mcb) = new_size_para;
                 memset(next_mcb, 0, 16);
               }
