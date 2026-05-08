@@ -1,6 +1,7 @@
 *~
 *.o
 *.com
+*.COM
 *.exe
 /kvikdos
 /kvikdos-soft
