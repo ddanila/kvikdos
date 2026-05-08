@@ -1706,6 +1706,21 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: error reading image in DOS .exe: %s\n", filename);
       exit(252);
     }
+    /* Zero everything past the loaded image up to the end of the
+     * allocation. The MZ EXE BSS lives there, and real DOS zero-
+     * initializes it on load — programs that declare uninitialized
+     * statics with `DB ?` (e.g. Volkov Commander 4.99.09's PathEr)
+     * rely on that being zero. We also zero past memsize_min_para up
+     * to memsize_available because programs that ask for "give me
+     * all you can" (maxalloc=0xFFFF) treat the full allocation as
+     * their workspace and may scan/read it before writing. */
+    {
+      const unsigned bss_offset = image_size;
+      const unsigned bss_end = (unsigned)memsize_available_para << 4;
+      if (bss_end > bss_offset) {
+        memset(image_addr + bss_offset, 0, bss_end - bss_offset);
+      }
+    }
     if (reloc_count) {  /* Process relocations. */
       unsigned short reloc[1024]; /* 2048 bytes on the stack. */
       if (header_size < 26) {  /* exehdr[EXE_RELOCPOS] is not available. */
