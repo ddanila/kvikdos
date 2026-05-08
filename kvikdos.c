@@ -2860,6 +2860,36 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
   sregs.fs.selector = sregs.gs.selector = ENV_PARA;  /* Random value after magic interrupt table. */
 
   memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
+  /* DOS stores an 8-byte uppercase program basename in the MCB at
+   * offset +8. Programs like Volkov Commander's Memory Info display
+   * this. Derive it from prog_filename's basename when available so
+   * "VC" / "MAKE" / etc. show up instead of the placeholder
+   * "KV1KPR0G". Test harnesses usually leave dir_state->dos_prog_abs
+   * as NULL, so we fall back to prog_filename in that case.
+   *
+   * Skipping the strict-mode signature check (is_mcb_bad at +7..+15)
+   * is fine in the test-harness path because it sets is_azzy=1; for
+   * the standalone CLI users typically run with --azzy too. If a
+   * program does run in strict mode and reads the MCB name, it'll
+   * get the original placeholder. */
+  if (g_azzy) {
+    const char *prog_src = (dir_state->dos_prog_abs && dir_state->dos_prog_abs[0])
+                           ? dir_state->dos_prog_abs
+                           : prog_filename;
+    if (prog_src && prog_src[0]) {
+      const char *p = prog_src + strlen(prog_src);
+      while (p != prog_src && p[-1] != '\\' && p[-1] != '/' && p[-1] != ':') --p;
+      { char *mcb_name = (char*)mem + (PROGRAM_MCB_PARA << 4) + 8;
+        unsigned i;
+        for (i = 0; i < 8 && p[i] && p[i] != '.'; ++i) {
+          char c = p[i];
+          if (c >= 'a' && c <= 'z') c -= 32;  /* DOS MCB names are uppercase. */
+          mcb_name[i] = c;
+        }
+        for (; i < 8; ++i) mcb_name[i] = ' ';  /* Pad with spaces. */
+      }
+    }
+  }
   { char *psp_args = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4)), emu_params->dos_version, PSP_PARA, ENV_PARA, (DOS_MEM_LIMIT >> 4) - PSP_PARA - 0x10) + 0x80;
     if (args) {
       copy_args_to_dos_args(psp_args, args);
