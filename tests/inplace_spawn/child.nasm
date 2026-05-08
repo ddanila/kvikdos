@@ -2,10 +2,11 @@
 ; child.nasm: minimal child for the in-place-spawn repro.
 ;
 ; Reads the parent PSP segment from PSP[0x16] (DOS records it there
-; on AH=4B AL=00 spawn). At parent_psp:0100h the parent stamped a
-; sentinel "KVKDPRT1" — if the parent's memory survived the spawn
-; intact, we read it back and exit AL=0. Otherwise (kvikdos's current
-; reset_emu+reload behavior) we read zeros and exit AL=0xFF.
+; on AH=4B AL=00 spawn). The parent stamps a sentinel "KVKDPRT1" in
+; its image (right after the 3-byte `jmp short begin; nop` prologue,
+; so at segment offset 0x103). If the parent's memory survived the
+; spawn intact, we read it back and exit AL=0. Otherwise (kvikdos's
+; pre-fix reset_emu+reload behaviour) we read zeros and exit AL=0xFF.
 ;
 ; This mirrors what Volkov Commander 4.99.09 does in VC.OVL — its
 ; first action is to look back at parent's load segment for the
@@ -24,11 +25,12 @@ _start:
         cmp     ax, 0
         je      .no_parent
 
-        ; Set ES to parent PSP. Read 8 bytes at parent_psp:0100h
-        ; and compare with expected sentinel.
+        ; Set ES to parent PSP. Read 8 bytes at parent_psp:0103h
+        ; (first byte after the parent's `jmp short begin; nop`
+        ; prologue, where the sentinel actually starts) and compare.
         mov     es, ax
         mov     si, sentinel_expected
-        mov     di, 0x100
+        mov     di, 0x103
         mov     cx, 8
         cld
 .cmp_loop:

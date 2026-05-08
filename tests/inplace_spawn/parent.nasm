@@ -7,8 +7,9 @@
 ; memory in-place while the child runs above it. The child sees the
 ; parent at its original load segment via PSP[0x16] (parent PSP).
 ;
-; Sentinel "KVKDPRT1" lives at offset 0 of the parent image, so child
-; can read it back as parent_psp:0100h.
+; Sentinel "KVKDPRT1" lives right after the parent's 3-byte
+; `jmp short begin; nop` prologue, at segment offset 0x103. The child
+; reads it back as parent_psp:0103h.
 ;
 ; Currently fails under kvikdos: kvikdos snapshots and wipes parent
 ; memory on spawn, so the sentinel reads as zeros and the child exits
