@@ -165,6 +165,33 @@ void cpu_write(CPU_t* cpu, uint32_t addr, uint8_t value) {
 			}
 		}
 	}
+	/* Diagnostic: watch a 4-byte range in linear memory for writes.
+	 * Set KVIKDOS_WATCH_ADDR=<linear hex> to print every byte write
+	 * inside [WATCH_ADDR, WATCH_ADDR+4). Prints up to 64 events. */
+	{
+		static int       watch_env_read = 0;
+		static unsigned  watch_addr = 0;
+		static int       watch_prints = 0;
+		if (!watch_env_read) {
+			const char *e = getenv("KVIKDOS_WATCH_ADDR");
+			if (e) watch_addr = (unsigned)strtoul(e, NULL, 0);
+			watch_env_read = 1;
+		}
+		if (watch_addr && (addr & 0xFFFFF) >= watch_addr &&
+		    (addr & 0xFFFFF) < watch_addr + 4 && watch_prints < 64) {
+			uint16_t sp = cpu->regs.wordregs[regsp];
+			uint16_t ss = cpu->segregs[regss];
+			fprintf(stderr, "WATCH: write addr=0x%05x val=%02x  cs:ip=%04x:%04x  ss:sp=%04x:%04x  ax=%04x bx=%04x si=%04x di=%04x ds=%04x es=%04x bp=%04x\n",
+			        addr & 0xFFFFF, value,
+			        cpu->segregs[regcs], cpu->ip,
+			        ss, sp,
+			        cpu->regs.wordregs[regax], cpu->regs.wordregs[regbx],
+			        cpu->regs.wordregs[regsi], cpu->regs.wordregs[regdi],
+			        cpu->segregs[regds], cpu->segregs[reges],
+			        cpu->regs.wordregs[regbp]);
+			watch_prints++;
+		}
+	}
 	(void)cpu;
 	addr &= 0xFFFFF;
 	if (addr < g_ctx.mem_size) {
