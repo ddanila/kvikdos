@@ -3151,13 +3151,16 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             if ((unsigned char)regs.rdx != 0xff) {  /* Output. */
               stdout_write_p = (const char*)&regs.rdx;
               goto do_stdout_write1;
-            } else {  /* Input. */
+            } else {  /* Input — non-blocking. DOS spec: ZF=0 + AL=key if a
+                       * key is available, ZF=1 otherwise. */
               unsigned short result_ax;
-              process_key(tty_state, 1, &result_ax, (unsigned short*)&regs.rflags);  /* Check availability without reading. */
-              if (*(unsigned short*)&regs.rflags & (1 << 6)) {  /* ZF==1. */
-                process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Read. */
+              process_key(tty_state, 1, &result_ax, (unsigned short*)&regs.rflags);  /* Peek (sets ZF). */
+              if (!(*(unsigned short*)&regs.rflags & (1 << 6))) {  /* ZF==0: key available. */
+                process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Pop the key. */
                 *(unsigned char*)&regs.rax = (unsigned char)result_ax;  /* Return only the keycode. */
+                *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* Re-assert ZF=0 after pop sets fresh ZF. */
               }
+              /* If ZF==1 (no key), leave AL unchanged and return — non-blocking. */
             }
           } else if (ah == 0x07 || ah == 0x08) {  /* Wait for console input without echo. */
             unsigned short result_ax;
@@ -3786,6 +3789,40 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               if (DEBUG) fprintf(stderr, "debug: ioctl generic_char_io dos_fd=%d\n", *(unsigned short*)&regs.rbx);
             } else if (al == 0x0e) {  /* Get logical drive map. */
               *(unsigned char*)&regs.rax = 0;  /* AL=0: only one logical drive assigned. */
+            } else if (al == 0x0f) {  /* Set logical drive map. */
+              /* "Designate which logical drive number is associated with the
+               * current physical block device." With a single mounted drive
+               * there is no aliasing, so just acknowledge. DOSBox returns
+               * AL=BL too. Volkov Commander 4.99.09's ErrorDrive path calls
+               * this when the user picks a different drive letter — without
+               * a handler kvikdos went fatal. */
+              *(unsigned char*)&regs.rax = (unsigned char)regs.rbx;
+            } else if (al == 0x0d) {  /* Generic Block Device Request.
+                                       * Sub-functions live in CL: 0x66 = Get
+                                       * Media ID (volume serial), 0x46 = Set
+                                       * Media ID, etc. Volkov Commander
+                                       * 4.99.09 issues 0x66 for serial
+                                       * checking on every panel refresh.
+                                       * Real DOS fills DS:DX with a Media ID
+                                       * struct: word InfoLevel, dword
+                                       * SerialNumber, 11-byte VolumeLabel,
+                                       * 8-byte FsType. We synthesize a
+                                       * stable serial 0x12345678 so VC
+                                       * doesn't keep re-detecting media
+                                       * change. */
+              const unsigned char cl0d = (unsigned char)regs.rcx;
+              if (cl0d == 0x66) {
+                char * const buf = (char*)mem + (sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+                memset(buf, 0, 25);
+                buf[2] = 0x78; buf[3] = 0x56; buf[4] = 0x34; buf[5] = 0x12;
+                memcpy(buf + 6, "VC_TEST    ", 11);
+                memcpy(buf + 17, "FAT12   ", 8);
+              } else if (cl0d == 0x46) {  /* Set Media ID — accept silently. */
+              } else {
+                /* Unknown sub-function: return CF=1, AX=1 (invalid function). */
+                *(unsigned short*)&regs.rax = 1;
+                goto error_on_21;
+              }
             } else {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: call=0x%02x dos_fd=%d\n", al, *(unsigned short*)&regs.rbx);
               goto fatal;
