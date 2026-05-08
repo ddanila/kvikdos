@@ -4679,7 +4679,17 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                   child_alloc_paras = child_prog_paras + 0x10;
                   alloc_rc = dos_alloc_paragraphs(mem, child_alloc_paras, malloc_strategy, &child_psp_para_alloc, &largest_para);
                   if (alloc_rc == 1 && memsize_min_para < memsize_max_para) {
-                    child_prog_paras = memsize_min_para;
+                    /* Real DOS hands the child the largest available block,
+                     * capped by memsize_max_para and floored at
+                     * memsize_min_para. Falling back to memsize_min_para
+                     * starves programs whose MZ header asks for "all you
+                     * can get" (maxalloc=0xffff): they boot with too little
+                     * memory and bail. Volkov Commander 4.99.09's VC.OVL
+                     * exhibits this — see PLAN_INPLACE_SPAWN.md. */
+                    unsigned candidate = largest_para > 0x10 ? largest_para - 0x10 : memsize_min_para;
+                    if (candidate > memsize_max_para) candidate = memsize_max_para;
+                    if (candidate < memsize_min_para) candidate = memsize_min_para;
+                    child_prog_paras = candidate;
                     child_alloc_paras = child_prog_paras + 0x10;
                     alloc_rc = dos_alloc_paragraphs(mem, child_alloc_paras, malloc_strategy, &child_psp_para_alloc, &largest_para);
                   }
