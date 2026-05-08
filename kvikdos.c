@@ -4737,16 +4737,21 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                 cleanup_fn[0] = '\0';
                 /* Load child image at the allocated segment. */
                 { char *child_psp_args = load_dos_executable_program(img_fd, prog_filename, mem, child_header, child_header_size, &regs, &sregs, &prog_block_size_dummy, emu_params->dos_version, child_psp_para_alloc, ipspawn_env_para, child_prog_paras) + 0x80;
-                  /* Build argument tail at child_psp+0x80. */
-                  if (args_str) {
-                    const unsigned size = strlen(args_str);
-                    if (size > 0x7e) {
-                      fprintf(stderr, "assert: in-place spawn args too long\n");
-                      exit(252);
-                    }
-                    *child_psp_args++ = (char)size;
-                    memcpy(child_psp_args, args_str, size);
-                    child_psp_args[size] = '\r';
+                  /* Build argument tail at child_psp+0x80.
+                   * The DOS command tail is binary: PSP[0x80] = length,
+                   * PSP[0x81..] = bytes (may include NULs), PSP[0x80+len+1]
+                   * = 0x0D (CR). Volkov Commander 4.99.09 passes a far
+                   * pointer plus a magic ID through the command tail and
+                   * the byte at offset 1 of its OvlPrm payload is a
+                   * literal 0 — using strlen() truncates that to 1 byte
+                   * and the OVL's signature check fails. Use args_size
+                   * (the original length byte) and copy from `args`,
+                   * which still holds the full unmodified payload at
+                   * args[0..args_size-1]. */
+                  if (args && args_size != 0) {
+                    *child_psp_args++ = (char)args_size;
+                    memcpy(child_psp_args, args, args_size);
+                    child_psp_args[args_size] = '\r';
                   } else {
                     *child_psp_args = 0;
                   }
