@@ -4550,11 +4550,18 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               if (is_args_normal) args[args_size] = '\0';  /* It was '\r'. */
               if (!(env && is_args_ok && is_dos_filename_high)) {
                 if (is_args_normal) args[args_size] = '\0';
-                fprintf(stderr, "fatal: bounds check failed (env_ok=%d args_ok=%d, fn_ok=%d) env when loading program=(%s) with args=(%s)\n",
+                /* Return DOS error rather than aborting. Reaching this point
+                 * usually means the program invoked AH=4B via a long-call to
+                 * a saved IVT[21h] vector with DS/ES not pointing into its
+                 * own load segment (Volkov Commander 4.05 does this). Real
+                 * DOS would surface a regular exec failure, which the caller
+                 * already handles gracefully ("Press ENTER" prompt). */
+                fprintf(stderr, "warn: AH=4B bounds check (env_ok=%d args_ok=%d, fn_ok=%d) program=(%s) args=(%s) — returning DOS error 5\n",
                         env != NULL, is_args_ok, is_dos_filename_high,
                         dos_filename, is_args_normal ? args : NULL);
                 if (is_args_normal) args[args_size] = '\r';
-                goto fatal_int;
+                *(unsigned short*)&regs.rax = 5;  /* access denied */
+                goto error_on_21;
               }
               if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, is_args_normal ? args : NULL);
               if (0 && al == 0) {  /* TODO(pts): Why stop? */
