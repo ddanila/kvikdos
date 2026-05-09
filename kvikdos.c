@@ -4772,8 +4772,18 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               dos_prog_abs = get_dos_abs_filename_r(prog_filename, new_prog_drive, dir_state, dosfnbuf);
               if (DEBUG) fprintf(stderr, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, new_prog_drive);
               if (dos_prog_abs[0] == '\0') {
-                fprintf(stderr, "fatal: error getting DOS absolute filename for exec on drive %c: %s\n", new_prog_drive, prog_filename);
-                exit(252);
+                /* Reverse map failed — typically because prog_filename
+                 * resolves to a host path that's outside any mounted
+                 * drive (e.g. "build/<ver>/VC.COM" when the test
+                 * harness drives kvikdos with a relative path).
+                 * Return a regular DOS file-not-found error instead
+                 * of aborting; the caller already handles exec
+                 * failures (Volkov Commander shows "Press ENTER"). */
+                if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: cannot map host path back to DOS: %s\n", prog_filename);
+                close(img_fd); img_fd = -1;
+                if (is_args_normal) args[args_size] = '\r';
+                *(unsigned short*)&regs.rax = 2;  /* File not found. */
+                goto error_on_21;
               }
               if (al == 3) {
                 /* Overlay load: copy env to ENV_PARA, fall through to do_exec
@@ -5017,6 +5027,14 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             } else {
               goto fatal_int;
             }
+          } else if (ah == 0x73) {
+            /* Win9x-DOS LFN extensions: AX=7303h Get Extended Free
+             * Space, AX=7301/2 etc. Volkov Commander 4.99.09 probes
+             * this after the panel renders. We don't implement the
+             * extended layout — return "function not supported"
+             * (AL=0, CF=1) and let the caller fall back to legacy
+             * AH=36h. */
+            goto nonfatal_unknown_int_21_call;
           } else if (ah == 0x65) {  /* Get extended country info (NLS). */
             /* Caller provides ES:DI = buffer, CX = buffer size. Returns CF=0, buffer filled. */
             const unsigned char al = (unsigned char)regs.rax;
@@ -5426,6 +5444,11 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
              * etc. We're not Windows; report "not running under
              * Windows" by returning AX unchanged (callers see
              * success/no-op semantics). */
+            /* AX unchanged. */
+          } else if (ah == 0x15) {
+            /* Network/CD-ROM/printer multiplex (AX=150B etc). Volkov
+             * Commander 4.99.09 probes this. Return AX unchanged:
+             * callers will see "service not present" semantics. */
             /* AX unchanged. */
           } else { fatal_uic:
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
