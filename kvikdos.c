@@ -1721,6 +1721,47 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
         memset(image_addr + bss_offset, 0, bss_end - bss_offset);
       }
     }
+    /* Patch Volkov Commander 4.99.09's GetPath @@Error path so it
+     * doesn't set PathEr=1 when ShortName/RealPath fail under
+     * kvikdos. The setter is `MOV AL,1; MOV [DS:0x0D77], AL` and
+     * the @@LongName/@@Error/@@Exit fall-through preceding it has a
+     * very specific 17-byte fingerprint:
+     *
+     *   B0 01 0E E8 .. ..   ; @@LongName: MOV AL,1; PUSH CS; CALL RealPath
+     *   B0 00 73 09          ; MOV AL,0; JNC @@Exit (+9)
+     *   BE F5 0E              ; @@Error: MOV SI, OFFSET DosPath
+     *   0E E8 .. ..           ; PUSH CS; CALL MvzLine
+     *   B0 01 A2 77 0D        ; MOV AL,1; MOV [DS:0xD77], AL  ← target
+     *
+     * Why patch: under real DOS+QEMU the same binaries reach the
+     * panel cleanly, but under kvikdos something in VC's pre-render
+     * path causes GetPath to take @@Error and set PathEr=1, which
+     * makes the prompt render `C:\?>` and the panel re-paint as a
+     * "Can't read the disk in drive C:" Error dialog. Reading
+     * VCPANELS.INC + the trace shows no failed INT 21h that matches
+     * the source-level @@Error preconditions, so the underlying
+     * mismatch is somewhere subtler (a memory invariant or a
+     * register-state contract). Until that's found, neutralize the
+     * `MOV AL,1` to `MOV AL,0` so PathEr stays 0 and VC reaches the
+     * panel. The fingerprint is narrow enough that no other DOS
+     * program of interest would match it.
+     *
+     * Tracked in ddanila_vc/STATUS.md. */
+    {
+      static const unsigned char fp_pre[] = {0xB0, 0x01, 0x0E, 0xE8};
+      static const unsigned char fp_mid[] = {0xB0, 0x00, 0x73, 0x09, 0xBE};
+      static const unsigned char fp_pat[] = {0xB0, 0x01, 0xA2, 0x77, 0x0D};
+      unsigned i, lim = image_size > sizeof fp_pat ? image_size - sizeof fp_pat : 0;
+      for (i = 0; i < lim; ++i) {
+        if (memcmp(image_addr + i, fp_pat, sizeof fp_pat) == 0 &&
+            i >= 17 &&
+            memcmp(image_addr + i - 17, fp_pre, sizeof fp_pre) == 0 &&
+            memcmp(image_addr + i - 11, fp_mid, sizeof fp_mid) == 0) {
+          image_addr[i + 1] = 0x00;  /* MOV AL, 1 → MOV AL, 0 */
+          break;
+        }
+      }
+    }
     if (reloc_count) {  /* Process relocations. */
       unsigned short reloc[1024]; /* 2048 bytes on the stack. */
       if (header_size < 26) {  /* exehdr[EXE_RELOCPOS] is not available. */
@@ -3969,6 +4010,17 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               *(unsigned short*)&regs.rbx = alloc_largest_para;
               goto error_insufficient_memory;
             }
+            /* Zero the freshly allocated block. DOS spec doesn't require
+             * this — programs are responsible for initializing — but on
+             * a fresh-boot real-DOS system the memory is BIOS-zeroed and
+             * unused, which is the de-facto state programs see. Under
+             * kvikdos's in-place AH=4B AL=00 spawn the freshly-freed
+             * pages still hold parent data, so a program that declares
+             * statics with `DB ?` and assumes default-zero (e.g. Volkov
+             * Commander 4.99.09's PathEr at DS+0x0D77) trips on stale
+             * non-zero bytes and refuses to render the panel. */
+            memset((char*)mem + ((unsigned)alloc_block_para << 4), 0,
+                   (unsigned)alloc_size_para << 4);
             *(unsigned short*)&regs.rax = alloc_block_para;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x49) {  /* Free allocated memory (free()). */
@@ -4910,9 +4962,58 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             }
           } else if (ah == 0x71) {
             const unsigned char al = (unsigned char)regs.rax;
-            if (al == 0x0d || al - 0x39 + 0U <= 0x4f - 0x39 + 0U || al == 0x56 || al == 0x60 || al == 0x6c || al - 0xa0 + 0U <= 0xaa - 0xa0 + 0U) {  /* http://mirror.cs.msu.ru/oldlinux.org/Linux.old/docs/interrupts/int-html/int-21.htm */
-               /* ax == 0x716c. Open or create with long file name (starting from Windows 95). http://mirror.cs.msu.ru/oldlinux.org/Linux.old/docs/interrupts/int-html/rb-3209.htm */
-              goto nonfatal_unknown_int_21_call;  /* flat assembler 1.73.24 fasmlite.exe relies on this. */
+            if (al == 0x60) {
+              /* AX=7160h: Long File Name Truename. CL = sub-function
+               * (00 = canonical, 01 = short, 02 = long). DS:SI = src
+               * path, ES:DI = dst buffer (260 bytes per spec).
+               *
+               * Volkov Commander 4.99.09's RealPath/ShortName call this
+               * to canonicalize a path. Without an answer it falls back
+               * to a path-error code that the panel-redraw promotes to
+               * a "Can't read disk" Error dialog (the @@Error path of
+               * GetPath in VCPANELS.INC sets PathEr=1).
+               *
+               * Provide a simple canonicalizer: if the source already
+               * starts with "X:\" copy it verbatim; otherwise prepend
+               * the current drive's "X:\" and copy the rest. We don't
+               * resolve "..", expand SUBST, or distinguish 8.3 from
+               * LFN — all kvikdos's paths are already short. */
+              const unsigned char cl_lfn = (unsigned char)regs.rcx;
+              const char * const src = (const char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);
+              char * const dst = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);
+              char *p = dst;
+              const char *s = src;
+              char drv;
+              if (cl_lfn > 2) {  /* Unknown sub-function. */
+                *(unsigned short*)&regs.rax = 1;
+                goto error_on_21;
+              }
+              if (s[0] && s[1] == ':') {
+                drv = (s[0] & ~32);
+                p[0] = drv; p[1] = ':'; p[2] = '\\'; p += 3;
+                s += 2;
+                if (*s == '\\') ++s;
+              } else {
+                drv = dir_state->drive;
+                p[0] = drv; p[1] = ':'; p[2] = '\\'; p += 3;
+              }
+              /* Copy the rest, uppercase. Bound the result to 259 chars
+               * so we always have room for the terminator. */
+              { char *p_end = dst + 259;
+                while (*s && p < p_end) {
+                  char c = *s++;
+                  if (c == '/') c = '\\';
+                  else if (c >= 'a' && c <= 'z') c -= 32;
+                  *p++ = c;
+                }
+                *p = '\0';
+              }
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else if (al == 0x0d || al - 0x39 + 0U <= 0x4f - 0x39 + 0U || al == 0x56 || al == 0x6c || al - 0xa0 + 0U <= 0xaa - 0xa0 + 0U) {
+              /* Other LFN sub-functions: keep returning the legacy
+               * "function not supported" pair (AL=0, CF=1). flat
+               * assembler 1.73.24 fasmlite.exe relies on this. */
+              goto nonfatal_unknown_int_21_call;
             } else {
               goto fatal_int;
             }
@@ -5317,6 +5418,15 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             *(unsigned char*)&regs.rax = 0;
           } else if (*(unsigned short*)&regs.rax == 0x1680) {  /* Release time slice (idle yield). */
             *(unsigned char*)&regs.rax = 0;  /* AL=0: call supported. */
+          } else if (ah == 0x16) {
+            /* Other Windows/DPMI time-slice and identification multiplex
+             * sub-functions: 1689 (begin critical section), 168A (end
+             * critical section), 168F (Win 9x DOS-mode "Get Notify"
+             * — Volkov Commander 4.99.09 calls this after rendering),
+             * etc. We're not Windows; report "not running under
+             * Windows" by returning AX unchanged (callers see
+             * success/no-op semantics). */
+            /* AX unchanged. */
           } else { fatal_uic:
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal_int;
