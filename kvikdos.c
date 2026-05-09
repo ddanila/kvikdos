@@ -3238,15 +3238,42 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               stdout_write_p = (const char*)&regs.rdx;
               goto do_stdout_write1;
             } else {  /* Input — non-blocking. DOS spec: ZF=0 + AL=key if a
-                       * key is available, ZF=1 otherwise. */
-              unsigned short result_ax;
-              process_key(tty_state, 1, &result_ax, (unsigned short*)&regs.rflags);  /* Peek (sets ZF). */
-              if (!(*(unsigned short*)&regs.rflags & (1 << 6))) {  /* ZF==0: key available. */
-                process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Pop the key. */
-                *(unsigned char*)&regs.rax = (unsigned char)result_ax;  /* Return only the keycode. */
-                *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* Re-assert ZF=0 after pop sets fresh ZF. */
+                       * key is available, ZF=1 otherwise.
+                       *
+                       * Extended keys (function keys, arrows) come back
+                       * across two AH=06 calls: the first returns AL=0
+                       * (the "extended key" marker), the second returns
+                       * AL = scan code. We track the pending scan code
+                       * in a static byte; if non-zero we deliver it
+                       * before peeking the next ring entry.
+                       *
+                       * Without this Volkov Commander 4.99.09 (and any
+                       * other program reading function keys via AH=06)
+                       * sees AL=0 and waits forever for the scan code,
+                       * because kvikdos's pop already removed the
+                       * 16-bit ring entry. */
+              static unsigned char pending_scan = 0;
+              if (pending_scan) {
+                *(unsigned char*)&regs.rax = pending_scan;
+                pending_scan = 0;
+                *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0. */
+              } else {
+                unsigned short result_ax;
+                process_key(tty_state, 1, &result_ax, (unsigned short*)&regs.rflags);  /* Peek. */
+                if (!(*(unsigned short*)&regs.rflags & (1 << 6))) {  /* ZF==0: key available. */
+                  process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Pop. */
+                  if ((unsigned char)result_ax == 0 && (unsigned char)(result_ax >> 8) != 0) {
+                    /* Extended key (e.g. F9 = 0x4300): return AL=0 now,
+                     * stash the scan code for the next AH=06 call. */
+                    pending_scan = (unsigned char)(result_ax >> 8);
+                    *(unsigned char*)&regs.rax = 0;
+                  } else {
+                    *(unsigned char*)&regs.rax = (unsigned char)result_ax;
+                  }
+                  *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* Re-assert ZF=0. */
+                }
+                /* If ZF==1 (no key), leave AL unchanged and return. */
               }
-              /* If ZF==1 (no key), leave AL unchanged and return — non-blocking. */
             }
           } else if (ah == 0x07 || ah == 0x08) {  /* Wait for console input without echo. */
             unsigned short result_ax;
@@ -5449,6 +5476,12 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
             /* Network/CD-ROM/printer multiplex (AX=150B etc). Volkov
              * Commander 4.99.09 probes this. Return AX unchanged:
              * callers will see "service not present" semantics. */
+            /* AX unchanged. */
+          } else if (ah == 0x01) {
+            /* Print Spooler multiplex. AX=0100h installation check
+             * leaves AL=0 ("not installed"). AX=01FFh and other
+             * sub-functions: leave AX unchanged so the caller sees
+             * "no spooler". Volkov Commander 4.99.09 probes this. */
             /* AX unchanged. */
           } else { fatal_uic:
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
