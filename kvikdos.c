@@ -4741,9 +4741,10 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                  * own load segment (Volkov Commander 4.05 does this). Real
                  * DOS would surface a regular exec failure, which the caller
                  * already handles gracefully ("Press ENTER" prompt). */
-                fprintf(stderr, "warn: AH=4B bounds check (env_ok=%d args_ok=%d, fn_ok=%d) program=(%s) args=(%s) — returning DOS error 5\n",
-                        env != NULL, is_args_ok, is_dos_filename_high,
+                fprintf(stderr, "kvikdos[pid=%d]: warn: AH=4B bounds check (env_ok=%d args_ok=%d, fn_ok=%d) program=(%s) args=(%s) — returning DOS error 5\n",
+                        (int)getpid(), env != NULL, is_args_ok, is_dos_filename_high,
                         dos_filename, is_args_normal ? args : NULL);
+                fflush(stderr);
                 if (is_args_normal) args[args_size] = '\r';
                 *(unsigned short*)&regs.rax = 5;  /* access denied */
                 goto error_on_21;
@@ -4789,7 +4790,9 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                 /* Return DOS error instead of crashing — VC.COM handles exec
                  * failure gracefully (shows "Press ENTER" prompt). */
                 if (is_args_normal) args[args_size] = '\r';
-                if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: file not found: %s: %s\n", prog_filename, strerror(errno));
+                fprintf(stderr, "kvikdos[pid=%d]: AH=4B open failed: dos=%s host=%s: %s\n",
+                        (int)getpid(), dos_filename, prog_filename, strerror(errno));
+                fflush(stderr);
                 *(unsigned short*)&regs.rax = (errno == ENOENT) ? 2 : 5;  /* 2=file not found, 5=access denied */
                 goto error_on_21;
               }
@@ -4809,7 +4812,9 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                  * Return a regular DOS file-not-found error instead
                  * of aborting; the caller already handles exec
                  * failures (Volkov Commander shows "Press ENTER"). */
-                if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: cannot map host path back to DOS: %s\n", prog_filename);
+                fprintf(stderr, "kvikdos[pid=%d]: AH=4B reverse-map failed: host=%s dos=%s\n",
+                        (int)getpid(), prog_filename, dos_filename);
+                fflush(stderr);
                 close(img_fd); img_fd = -1;
                 if (is_args_normal) args[args_size] = '\r';
                 *(unsigned short*)&regs.rax = 2;  /* File not found. */
