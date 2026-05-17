@@ -16,6 +16,7 @@
 #include "test_harness.h"
 
 #include <pthread.h>
+#include <unistd.h>
 
 /* --- Harness state --- */
 
@@ -69,9 +70,13 @@ static void *emu_thread_func(void *arg) {
   init_tty_state(&tty_state, -3);
   init_emu(&emu);
 
+  fprintf(stderr, "kvikdos[pid=%d]: emu thread starting prog=%s mount=%s\n",
+          (int)getpid(), a->prog_path, a->mount_dir);
+  fflush(stderr);
   emu_exit_code = run_dos_prog(&emu, a->prog_path, NULL, args, &dir_state,
                                 &tty_state, &emu_params, envp);
-  fprintf(stderr, "kvikdos: emu thread exited code=%d\n", emu_exit_code);
+  fprintf(stderr, "kvikdos[pid=%d]: emu thread exited code=%d prog=%s mount=%s\n",
+          (int)getpid(), emu_exit_code, a->prog_path, a->mount_dir);
   fflush(stderr);
   emu_running = 0;
   return NULL;
