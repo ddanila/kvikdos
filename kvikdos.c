@@ -4728,7 +4728,14 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               const unsigned char args_size = args ? (unsigned char)args[-1] : 0;
               const char is_args_normal = args && (args_size < 0x7f && (args[args_size] == '\0' || args[args_size] == '\r')); /* '\0' for al == 0 when Borland C++ 2.0 compiler bcc.exe; '\r' for normal DOS exec */
               const char is_args_ok = is_args_normal || (args && args_size == '\n' && args[0] == '\n' && args[1] == '.');  /* Power C 2.2.0 compiler pc.exe. Copy all 128 bytes to new PSP. */
-              const char is_dos_filename_high = sregs.ds.selector + (*(unsigned short*)&regs.rdx >> 4) >= PSP_PARA;  /* So that dos_filename won't overlap new_env below. */
+              /* dos_filename must live above the BIOS / IVT area kvikdos owns
+               * (0..ENV_PARA). VC 4.05's child-exec path legitimately puts
+               * the filename inside the env block — env_seg = ENV_PARA, with
+               * the string at a small offset — so the previous PSP_PARA
+               * threshold rejected a valid pointer and surfaced as exit
+               * AL=1 ("Memory allocation error") in test_menu. ENV_PARA is
+               * the lowest paragraph kvikdos exposes as program-readable. */
+              const char is_dos_filename_high = sregs.ds.selector + (*(unsigned short*)&regs.rdx >> 4) >= ENV_PARA;
               char *new_env;
               char new_prog_drive;
               int reason;
