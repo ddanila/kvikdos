@@ -71,6 +71,8 @@ static void *emu_thread_func(void *arg) {
 
   emu_exit_code = run_dos_prog(&emu, a->prog_path, NULL, args, &dir_state,
                                 &tty_state, &emu_params, envp);
+  fprintf(stderr, "kvikdos: emu thread exited code=%d\n", emu_exit_code);
+  fflush(stderr);
   emu_running = 0;
   return NULL;
 }

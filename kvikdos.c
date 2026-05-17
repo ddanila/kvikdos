@@ -3230,6 +3230,9 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               if (DEBUG) fprintf(stderr, "debug: spawn returned exit_code=%d, resuming parent\n", exit_al);
               goto set_sregs_regs_and_continue;
             }
+            fprintf(stderr, "kvikdos: dos terminate int=0x%02x ah=0x%02x al=%u cs=%04x ip=%04x\n",
+                    int_num, ah, (unsigned)exit_al, int_cs, int_ip);
+            fflush(stderr);
             return exit_al;
            }
           } else if (ah == 0x06) {  /* Direct console I/O. */
