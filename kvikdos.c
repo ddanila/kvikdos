@@ -4802,25 +4802,29 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
               }
               strcpy(fnbuf2, args);  /* Large enough to hold 0x7f bytes. */
               args_str = fnbuf2;
-              dos_prog_abs = get_dos_abs_filename_r(prog_filename, new_prog_drive, dir_state, dosfnbuf);
-              if (DEBUG) fprintf(stderr, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, new_prog_drive);
-              if (dos_prog_abs[0] == '\0') {
-                /* Reverse map failed — typically because prog_filename
-                 * resolves to a host path that's outside any mounted
-                 * drive (e.g. "build/<ver>/VC.COM" when the test
-                 * harness drives kvikdos with a relative path).
-                 * Return a regular DOS file-not-found error instead
-                 * of aborting; the caller already handles exec
-                 * failures (Volkov Commander shows "Press ENTER"). */
-                fprintf(stderr, "kvikdos[pid=%d]: AH=4B reverse-map failed: host=%s dos=%s\n",
-                        (int)getpid(), prog_filename, dos_filename);
-                fflush(stderr);
-                close(img_fd); img_fd = -1;
-                if (is_args_normal) args[args_size] = '\r';
-                *(unsigned short*)&regs.rax = 2;  /* File not found. */
-                goto error_on_21;
-              }
               if (al == 3) {
+                /* AL=3 is overlay/full-reset: the child replaces the parent,
+                 * so it needs its own DOS absolute pathname (used as the
+                 * env-block "program name" in line 3023). Re-derive it from
+                 * the resolved host path. */
+                dos_prog_abs = get_dos_abs_filename_r(prog_filename, new_prog_drive, dir_state, dosfnbuf);
+                if (DEBUG) fprintf(stderr, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, new_prog_drive);
+                if (dos_prog_abs[0] == '\0') {
+                  /* Reverse map failed — typically because prog_filename
+                   * resolves to a host path that's outside any mounted
+                   * drive (e.g. "build/<ver>/VC.COM" when the test
+                   * harness drives kvikdos with a relative path).
+                   * Return a regular DOS file-not-found error instead
+                   * of aborting; the caller already handles exec
+                   * failures (Volkov Commander shows "Press ENTER"). */
+                  fprintf(stderr, "kvikdos[pid=%d]: AH=4B reverse-map failed: host=%s dos=%s\n",
+                          (int)getpid(), prog_filename, dos_filename);
+                  fflush(stderr);
+                  close(img_fd); img_fd = -1;
+                  if (is_args_normal) args[args_size] = '\r';
+                  *(unsigned short*)&regs.rax = 2;  /* File not found. */
+                  goto error_on_21;
+                }
                 /* Overlay load: copy env to ENV_PARA, fall through to do_exec
                  * (full reset semantics — parent is not resumed). */
                 *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
@@ -4828,6 +4832,13 @@ KVIKDOS_STATIC unsigned char run_dos_prog(struct EmuState *emu, const char *prog
                 (void)new_env;
                 goto do_exec;
               }
+              /* AL=0 in-place spawn: parent keeps its identity (dos_prog_abs
+               * unchanged), child shares parent's env. Reassigning
+               * dos_prog_abs here would clobber the parent's path, which
+               * later trips strcmp() in get_linux_filename_r() (line 277)
+               * the next time the parent resolves the same DOS pathname,
+               * returning dir_state->linux_prog (the parent's host path)
+               * for what is actually the child's filename. */
               /* AL=0: in-place child spawn. Keep parent in memory; allocate
                * a new MCB for the child above the parent's resident block.
                * On child exit (AH=4C), free child's MCBs and resume parent. */
